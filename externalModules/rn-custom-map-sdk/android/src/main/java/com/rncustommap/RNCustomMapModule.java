@@ -1,20 +1,25 @@
 package com.rncustommap;
 
+import android.util.Log;
+import android.view.View;
+
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
-import com.facebook.react.bridge.UIManager;
-import com.facebook.react.bridge.UiThreadUtil;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.UIManager;
+import com.facebook.react.bridge.UiThreadUtil;
+import com.facebook.react.bridge.WritableNativeMap;
 import com.facebook.react.module.annotations.ReactModule;
 import com.facebook.react.uimanager.UIManagerHelper;
-import android.view.View;
 
 @ReactModule(name = RNCustomMapModule.NAME)
 public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
   public static final String NAME = NativeRNCustomMapViewManagerSpec.NAME;
+  private static final String TAG = "RNCustomMapModule";
 
   public RNCustomMapModule(ReactApplicationContext reactContext) {
     super(reactContext);
@@ -26,137 +31,148 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
     return NAME;
   }
 
+  /**
+   * Resolve the RNCustomMapView for a given React tag using the canonical
+   * UIManager lookup. Works under both Paper and Fabric (New Arch),
+   * is thread-safe (we hop onto the UI thread first), and avoids the
+   * stale-state problems of a manual WeakHashMap.
+   */
+  @Nullable
+  private RNCustomMapView resolveMap(int reactTag) {
+    UIManager uiManager =
+        UIManagerHelper.getUIManagerForReactTag(getReactApplicationContext(), reactTag);
+    if (uiManager == null) {
+      Log.e(TAG, "resolveMap: no UIManager for tag=" + reactTag);
+      return null;
+    }
+    View view = uiManager.resolveView(reactTag);
+    if (view instanceof RNCustomMapView) {
+      return (RNCustomMapView) view;
+    }
+    Log.e(TAG, "resolveMap: tag=" + reactTag + " resolved to " +
+        (view == null ? "null" : view.getClass().getName()));
+    return null;
+  }
+
+  /** Marshals onto the UI thread and runs the action with a resolved map view. */
+  private void withMap(int reactTag, String method, MapAction action) {
+    UiThreadUtil.runOnUiThread(() -> {
+      RNCustomMapView view = resolveMap(reactTag);
+      Log.d(TAG, method + " entered: tag=" + reactTag + " view=" + (view == null ? "null" : "ok"));
+      if (view == null) {
+        return;
+      }
+      try {
+        action.run(view);
+      } catch (RuntimeException e) {
+        Log.e(TAG, method + " threw", e);
+      }
+    });
+  }
+
+  private interface MapAction {
+    void run(RNCustomMapView view);
+  }
+
+  // -------------------- Map methods --------------------
+
   @Override
   public void animateToRegion(double reactTag, ReadableMap region, double duration) {
-    RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-    if (view != null) {
-      RNCustomMapViewManagerImpl.setRegion(view, region, false);
-    }
+    withMap((int) reactTag, "animateToRegion", view ->
+        RNCustomMapViewManagerImpl.setRegion(view, region, false));
   }
 
   @Override
   public void animateToCoordinate(double reactTag, ReadableMap coordinate, double duration) {
-    RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-    if (view != null) {
-      com.facebook.react.bridge.WritableNativeMap camera = new com.facebook.react.bridge.WritableNativeMap();
-      camera.putMap("center", coordinate);
-      camera.putDouble("zoom", view.googleMap == null ? 12d : view.googleMap.getCameraPosition().zoom);
+    withMap((int) reactTag, "animateToCoordinate", view -> {
+      WritableNativeMap center = new WritableNativeMap();
+      center.putDouble("latitude", coordinate.getDouble("latitude"));
+      center.putDouble("longitude", coordinate.getDouble("longitude"));
+      WritableNativeMap camera = new WritableNativeMap();
+      camera.putMap("center", center);
+      camera.putDouble("zoom",
+          view.googleMap == null ? 12d : view.googleMap.getCameraPosition().zoom);
       RNCustomMapViewManagerImpl.setCamera(view, camera, (int) duration);
-    }
+    });
   }
 
   @Override
-  public void fitToCoordinates(double reactTag, ReadableArray coordinates, @Nullable ReadableMap options) {
-    RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-    if (view != null) {
-      RNCustomMapViewManagerImpl.fitToCoordinates(view, coordinates, options);
-    }
+  public void fitToCoordinates(double reactTag, ReadableArray coordinates,
+                               @Nullable ReadableMap options) {
+    withMap((int) reactTag, "fitToCoordinates", view ->
+        RNCustomMapViewManagerImpl.fitToCoordinates(view, coordinates, options));
   }
 
   @Override
   public void fitToElements(double reactTag, @Nullable ReadableMap options) {
-    RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-    if (view != null) {
-      RNCustomMapViewManagerImpl.fitToElements(view, options);
-    }
+    withMap((int) reactTag, "fitToElements", view ->
+        RNCustomMapViewManagerImpl.fitToElements(view, options));
   }
 
   @Override
-  public void fitToSuppliedMarkers(double reactTag, ReadableArray markerIds, @Nullable ReadableMap options) {
-    RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-    if (view != null) {
-      RNCustomMapViewManagerImpl.fitToSuppliedMarkers(view, markerIds, options);
-    }
+  public void fitToSuppliedMarkers(double reactTag, ReadableArray markerIds,
+                                   @Nullable ReadableMap options) {
+    withMap((int) reactTag, "fitToSuppliedMarkers", view ->
+        RNCustomMapViewManagerImpl.fitToSuppliedMarkers(view, markerIds, options));
   }
 
   @Override
   public void getCamera(double reactTag, Promise promise) {
-    RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-    if (view == null) {
-      promise.reject("E_NO_VIEW", "RNCustomMapView not found");
-    } else {
+    UiThreadUtil.runOnUiThread(() -> {
+      RNCustomMapView view = resolveMap((int) reactTag);
+      if (view == null) {
+        promise.reject("E_NO_VIEW", "RNCustomMapView not found for tag " + (int) reactTag);
+        return;
+      }
       promise.resolve(RNCustomMapViewManagerImpl.camera(view));
-    }
+    });
   }
 
   @Override
   public void setCamera(double reactTag, ReadableMap camera, double duration) {
-    RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-    if (view != null) {
-      RNCustomMapViewManagerImpl.setCamera(view, camera, (int) duration);
-    }
+    withMap((int) reactTag, "setCamera", view ->
+        RNCustomMapViewManagerImpl.setCamera(view, camera, (int) duration));
   }
 
   @Override
   public void getMarkers(double reactTag, Promise promise) {
-    RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-    if (view == null) {
-      promise.reject("E_NO_VIEW", "RNCustomMapView not found");
-    } else {
+    UiThreadUtil.runOnUiThread(() -> {
+      RNCustomMapView view = resolveMap((int) reactTag);
+      if (view == null) {
+        promise.reject("E_NO_VIEW", "RNCustomMapView not found for tag " + (int) reactTag);
+        return;
+      }
       promise.resolve(RNCustomMapViewManagerImpl.markers(view));
-    }
+    });
   }
 
-  // @Override
-  // public void showMarkerCallout(double reactTag, String markerId) {
-  //   RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-  //   if (view != null) {
-  //     RNCustomMapViewManagerImpl.showMarkerCallout(view, markerId);
-  //   }
-  // }
-
-  // @Override
-  // public void hideMarkerCallout(double reactTag, String markerId) {
-  //   RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-  //   if (view != null) {
-  //     RNCustomMapViewManagerImpl.hideMarkerCallout(view, markerId);
-  //   }
-  // }
-
-  // @Override
-  // public void redrawMarker(double reactTag, String markerId) {
-  //   RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-  //   if (view != null) {
-  //     RNCustomMapViewManagerImpl.redrawMarker(view, markerId);
-  //   }
-  // }
-
-  // @Override
-  // public void animateMarkerToCoordinate(
-  //     double reactTag,
-  //     String markerId,
-  //     ReadableMap coordinate,
-  //     @Nullable ReadableMap options) {
-  //   RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-  //   if (view != null) {
-  //     RNCustomMapViewManagerImpl.animateMarkerToCoordinate(view, markerId, coordinate, options);
-  //   }
-  // }
+  // -------------------- Marker methods --------------------
 
   @Override
   public void showMarkerCallout(double reactTag, String markerId) {
-      RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-      if (view != null && markerId != null && !markerId.isEmpty()) {
-          RNCustomMapViewManagerImpl.showMarkerCallout(view, markerId);
-      } else {
-          Log.e("RNCustomMapModule", "showMarkerCallout failed: view or markerId null");
+    withMap((int) reactTag, "showMarkerCallout", view -> {
+      if (markerId == null || markerId.isEmpty()) {
+        Log.e(TAG, "showMarkerCallout: markerId is null/empty");
+        return;
       }
+      RNCustomMapViewManagerImpl.showMarkerCallout(view, markerId);
+    });
   }
 
   @Override
   public void hideMarkerCallout(double reactTag, String markerId) {
-      RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-      if (view != null && markerId != null && !markerId.isEmpty()) {
-          RNCustomMapViewManagerImpl.hideMarkerCallout(view, markerId);
-      }
+    withMap((int) reactTag, "hideMarkerCallout", view -> {
+      if (markerId == null || markerId.isEmpty()) return;
+      RNCustomMapViewManagerImpl.hideMarkerCallout(view, markerId);
+    });
   }
 
   @Override
   public void redrawMarker(double reactTag, String markerId) {
-      RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-      if (view != null && markerId != null && !markerId.isEmpty()) {
-          RNCustomMapViewManagerImpl.redrawMarker(view, markerId);
-      }
+    withMap((int) reactTag, "redrawMarker", view -> {
+      if (markerId == null || markerId.isEmpty()) return;
+      RNCustomMapViewManagerImpl.redrawMarker(view, markerId);
+    });
   }
 
   @Override
@@ -165,23 +181,22 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
       String markerId,
       ReadableMap coordinate,
       @Nullable ReadableMap options) {
-      RNCustomMapView view = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-      if (view != null && markerId != null && !markerId.isEmpty() && coordinate != null) {
-          RNCustomMapViewManagerImpl.animateMarkerToCoordinate(view, markerId, coordinate, options);
-      }
+    withMap((int) reactTag, "animateMarkerToCoordinate", view -> {
+      if (markerId == null || markerId.isEmpty() || coordinate == null) return;
+      RNCustomMapViewManagerImpl.animateMarkerToCoordinate(view, markerId, coordinate, options);
+    });
   }
 
   @Override
   public void setMarkerView(double reactTag, String markerId, double markerViewTag) {
     UiThreadUtil.runOnUiThread(() -> {
-      RNCustomMapView mapView = RNCustomMapViewManagerImpl.findViewByTag((int) reactTag);
-      if (mapView == null) {
-        return;
-      }
-      UIManager uiManager = UIManagerHelper.getUIManagerForReactTag(getReactApplicationContext(), (int) markerViewTag);
-      if (uiManager == null) {
-        return;
-      }
+      RNCustomMapView mapView = resolveMap((int) reactTag);
+      if (mapView == null) return;
+
+      UIManager uiManager =
+          UIManagerHelper.getUIManagerForReactTag(getReactApplicationContext(), (int) markerViewTag);
+      if (uiManager == null) return;
+
       View markerView = uiManager.resolveView((int) markerViewTag);
       if (markerView != null) {
         RNCustomMapViewManagerImpl.setMarkerView(mapView, markerId, markerView);
