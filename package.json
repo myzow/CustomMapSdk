@@ -7,13 +7,26 @@
     "ios": "react-native run-ios",
     "lint": "eslint .",
     "start": "react-native start",
-    "test": "jest"
+    "test": "jest",
+    "gradleClean": "cd android && ./gradlew clean && cd ..",
+    "gradleStop": "cd android && ./gradlew --stop && cd ..",
+    "both": "react-native run-android && react-native run-ios",
+    "apk": "cd android && ./gradlew assembleRelease",
+    "bundle": "cd android && ./gradlew bundleRelease",
+    "logs": "npx react-native log-android && npx react-native log-ios",
+    "postinstall": "patch-package && npx jetify",
+    "align-deps": "rnx-align-deps --check",
+    "align-deps:write": "rnx-align-deps --write",
+    "rnvi:update-plist": "rnvi-update-plist package.json ios/Fuzz/Info.plist",
+    "linkRNAssets": "npx react-native-asset",
+    "build:scripts": "tsc scripts/buildAndUploadSourcemap.ts --outDir dist",
+    "release": "yarn build:scripts && node dist/buildAndUploadSourcemap.js"
   },
   "dependencies": {
+    "@react-native/new-app-screen": "0.83.4",
     "react": "19.2.0",
     "react-native": "0.83.4",
-    "@react-native/new-app-screen": "0.83.4",
-    "react-native-safe-area-context": "^5.5.2"
+    "rn-custom-map-sdk": "file:externalModules/rn-custom-map-sdk"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",

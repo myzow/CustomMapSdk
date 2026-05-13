@@ -1,0 +1,30 @@
+plugins {
+    id "com.android.library"
+    id "com.facebook.react"
+}
+
+react {
+    jsRootDir = file("..")
+    libraryName = "RNCustomMapSpec"
+    codegenJavaPackageName = "com.rncustommap"
+}
+
+android {
+    namespace "com.rncustommap"
+    compileSdkVersion rootProject.ext.has("compileSdkVersion") ? rootProject.ext.compileSdkVersion : 35
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.has("minSdkVersion") ? rootProject.ext.minSdkVersion : 23
+        targetSdkVersion rootProject.ext.has("targetSdkVersion") ? rootProject.ext.targetSdkVersion : 35
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+dependencies {
+    implementation "com.facebook.react:react-android"
+    implementation "com.google.android.gms:play-services-maps:18.2.0"
+    implementation "com.github.bumptech.glide:glide:4.16.0"
+}

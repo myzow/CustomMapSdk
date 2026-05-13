@@ -1,0 +1,43 @@
+{
+  "name": "rn-custom-map-sdk",
+  "version": "1.0.0",
+  "description": "Fabric-ready React Native map SDK with MapView, Marker, Callout, Polyline, and Circle.",
+  "main": "index.tsx",
+  "react-native": "index.tsx",
+  "types": "index.d.ts",
+  "files": [
+    "android",
+    "ios",
+    "src",
+    "spec",
+    "index.tsx",
+    "index.d.ts",
+    "RNCustomMap.podspec",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.72"
+  },
+  "devDependencies": {
+    "@react-native/codegen": "*",
+    "@types/react": "*",
+    "typescript": "*"
+  },
+  "codegenConfig": {
+    "name": "RNCustomMapSpec",
+    "type": "all",
+    "jsSrcsDir": "spec",
+    "android": {
+      "javaPackageName": "com.rncustommap"
+    },
+    "ios": {
+      "componentProvider": {
+        "RNCustomMapView": "RNCustomMapView"
+      }
+    }
+  }
+}
