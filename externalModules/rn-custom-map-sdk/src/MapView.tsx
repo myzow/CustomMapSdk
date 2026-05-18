@@ -5,13 +5,16 @@ import React, {
   useImperativeHandle,
   useMemo,
   useRef,
+  useState,
 } from 'react';
 import {
   findNodeHandle,
   Image,
   Platform,
   StyleSheet,
+  Text,
   View,
+  type LayoutChangeEvent,
   type NativeSyntheticEvent,
 } from 'react-native';
 import NativeMapView from '../spec/RNCustomMapViewNativeComponent';
@@ -20,9 +23,12 @@ import Callout from './Callout';
 import Circle from './Circle';
 import Marker from './Marker';
 import Polyline from './Polyline';
+import { clusterPoints, type Cluster as EngineCluster, type ClusterPoint } from './clustering/cluster';
 import type {
   Camera,
   CircleProps,
+  Cluster,
+  ClusterConfig,
   Coordinate,
   MapViewMethods,
   MapViewProps,
@@ -39,6 +45,8 @@ import type {
 
 const DEFAULT_DURATION = 500;
 const DEFAULT_FIT_PADDING = 50;
+const DEFAULT_CLUSTER_RADIUS = 60;
+const CLUSTER_MARKER_PREFIX = 'cluster:';
 
 type EventPayload<T> = NativeSyntheticEvent<T>;
 
@@ -47,15 +55,20 @@ type MarkerSnapshot = {
   children: React.ReactNode;
 };
 
+type MarkerMeta = {
+  id: string;
+  coordinate: Coordinate;
+  data?: any;
+  title?: string;
+};
+
 function childTypeName(child: React.ReactElement) {
   const type = child.type as any;
   return type?.displayName || type?.name;
 }
 
 function resolveImageSource(source: MarkerProps['image']): string | undefined {
-  if (!source) {
-    return undefined;
-  }
+  if (!source) return undefined;
   const resolved = Image.resolveAssetSource(source);
   return resolved?.uri;
 }
@@ -69,17 +82,13 @@ function compactObject<T extends Record<string, unknown>>(value: T): T {
 function getMarkerCallout(marker: React.ReactElement<MarkerProps>) {
   let tooltip = false;
   let onPress: MarkerProps['onCalloutPress'];
-
   React.Children.forEach(marker.props.children, child => {
-    if (!React.isValidElement(child)) {
-      return;
-    }
+    if (!React.isValidElement(child)) return;
     if (child.type === Callout || childTypeName(child) === 'RNCustomMapCallout') {
       tooltip = Boolean((child.props as any).tooltip);
       onPress = (child.props as any).onPress;
     }
   });
-
   return { tooltip, onPress };
 }
 
@@ -111,12 +120,11 @@ function parseChildren(children: React.ReactNode) {
   const polylinePressHandlers = new Map<string, PolylineProps['onPress']>();
   const markerRefs = new Map<string, React.Ref<MarkerMethods>>();
   const markerSnapshots: MarkerSnapshot[] = [];
+  /** id → {data, title, coordinate} — JS-only, never bridged. */
+  const markerMeta = new Map<string, MarkerMeta>();
 
   React.Children.forEach(children, (child, index) => {
-    if (!React.isValidElement(child)) {
-      return;
-    }
-
+    if (!React.isValidElement(child)) return;
     const name = childTypeName(child);
 
     if (child.type === Marker || name === 'RNCustomMapMarker') {
@@ -148,30 +156,18 @@ function parseChildren(children: React.ReactNode) {
         calloutTooltip: callout.tooltip,
       }));
 
-      if (markerRef) {
-        markerRefs.set(id, markerRef);
-      }
-      if (customChildren) {
-        markerSnapshots.push({ id, children: customChildren });
-      }
-      if (props.onPress) {
-        markerPressHandlers.set(id, props.onPress);
-      }
-      if (props.onSelect) {
-        markerSelectHandlers.set(id, props.onSelect);
-      }
-      if (props.onDeselect) {
-        markerDeselectHandlers.set(id, props.onDeselect);
-      }
-      if (props.onDragStart) {
-        markerDragStartHandlers.set(id, props.onDragStart);
-      }
-      if (props.onDrag) {
-        markerDragHandlers.set(id, props.onDrag);
-      }
-      if (props.onDragEnd) {
-        markerDragEndHandlers.set(id, props.onDragEnd);
-      }
+      // userData is an alias of data; explicit `data` wins.
+      const data = props.data !== undefined ? props.data : props.userData;
+      markerMeta.set(id, { id, coordinate: props.coordinate, data, title: props.title });
+
+      if (markerRef) markerRefs.set(id, markerRef);
+      if (customChildren) markerSnapshots.push({ id, children: customChildren });
+      if (props.onPress) markerPressHandlers.set(id, props.onPress);
+      if (props.onSelect) markerSelectHandlers.set(id, props.onSelect);
+      if (props.onDeselect) markerDeselectHandlers.set(id, props.onDeselect);
+      if (props.onDragStart) markerDragStartHandlers.set(id, props.onDragStart);
+      if (props.onDrag) markerDragHandlers.set(id, props.onDrag);
+      if (props.onDragEnd) markerDragEndHandlers.set(id, props.onDragEnd);
       if (props.onCalloutPress || callout.onPress) {
         calloutPressHandlers.set(id, (props.onCalloutPress ?? callout.onPress)!);
       }
@@ -191,9 +187,7 @@ function parseChildren(children: React.ReactNode) {
         zIndex: props.zIndex,
         tappable: props.tappable,
       }));
-      if (props.onPress) {
-        polylinePressHandlers.set(id, props.onPress);
-      }
+      if (props.onPress) polylinePressHandlers.set(id, props.onPress);
       return;
     }
 
@@ -225,13 +219,13 @@ function parseChildren(children: React.ReactNode) {
     polylinePressHandlers,
     markerRefs,
     markerSnapshots,
+    markerMeta,
   };
 }
 
 function setMarkerRef(ref: React.Ref<MarkerMethods>, value: MarkerMethods | null) {
-  if (typeof ref === 'function') {
-    ref(value);
-  } else if (ref && 'current' in ref) {
+  if (typeof ref === 'function') ref(value);
+  else if (ref && 'current' in ref) {
     (ref as React.MutableRefObject<MarkerMethods | null>).current = value;
   }
 }
@@ -239,19 +233,13 @@ function setMarkerRef(ref: React.Ref<MarkerMethods>, value: MarkerMethods | null
 function markerAnimationOptions(
   durationOrOptions: number | MarkerAnimationOptions | undefined,
 ): MarkerAnimationOptions {
-  if (typeof durationOrOptions === 'number') {
-    return { duration: durationOrOptions };
-  }
+  if (typeof durationOrOptions === 'number') return { duration: durationOrOptions };
   return { duration: DEFAULT_DURATION, ...durationOrOptions };
 }
 
 function fitOptions(options?: number | { animated?: boolean; padding?: number; edgePadding?: any }) {
   if (typeof options === 'number') {
-    return {
-      animated: true,
-      padding: options,
-      edgePadding: undefined,
-    };
+    return { animated: true, padding: options, edgePadding: undefined };
   }
   return {
     animated: options?.animated ?? true,
@@ -259,6 +247,19 @@ function fitOptions(options?: number | { animated?: boolean; padding?: number; e
     edgePadding: options?.edgePadding,
   };
 }
+
+/** Default cluster visual used when the consumer didn't provide one. */
+function DefaultClusterBubble({ cluster }: { cluster: Cluster }) {
+  return (
+    <View style={defaultClusterStyles.bubble}>
+      <Text style={defaultClusterStyles.text}>{cluster.pointCount}</Text>
+    </View>
+  );
+}
+
+// ============================================================================
+// Component
+// ============================================================================
 
 const MapView = forwardRef<MapViewMethods, MapViewProps>(
   (
@@ -271,6 +272,9 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       onMapReady,
       onUserLocationChange,
       customMapStyle,
+      clusterConfig,
+      initialRegion,
+      region,
       ...props
     },
     ref,
@@ -279,28 +283,28 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     const markerViewTags = useRef(new Map<string, number>());
     const parsed = useMemo(() => parseChildren(children), [children]);
 
+    // ------------------------------------------------------------------
+    // Tag resolution
+    // ------------------------------------------------------------------
     const getReactTag = useCallback(() => {
       const tag = findNodeHandle(nativeRef.current);
-      if (tag == null) {
-        // Do NOT throw — edge-indicator callbacks frequently fire on the
-        // very first frame before findNodeHandle resolves. Returning -1
-        // lets the native module's resolveMap() short-circuit cleanly and
-        // log a warning instead of crashing the JS thread.
-        return -1;
-      }
-      return tag;
+      // Do NOT throw — first-frame callers may arrive before findNodeHandle
+      // resolves. Return -1 so the native side cleanly short-circuits.
+      return tag == null ? -1 : tag;
     }, []);
-
     const getReactTagSafe = useCallback(() => {
       const tag = getReactTag();
       return tag >= 0 ? tag : null;
     }, [getReactTag]);
 
+    // ------------------------------------------------------------------
+    // Imperative API
+    // ------------------------------------------------------------------
     useImperativeHandle(ref, () => ({
-      animateToRegion(region: Region, duration = DEFAULT_DURATION) {
+      animateToRegion(r: Region, duration = DEFAULT_DURATION) {
         const tag = getReactTagSafe();
         if (tag == null) return;
-        NativeMapViewManager.animateToRegion(tag, region, duration);
+        NativeMapViewManager.animateToRegion(tag, r, duration);
       },
       animateToCoordinate(coordinate: Coordinate, duration = DEFAULT_DURATION) {
         const tag = getReactTagSafe();
@@ -333,8 +337,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       getMarkers() {
         return NativeMapViewManager.getMarkers(getReactTag());
       },
-      // Lifecycle commands — used by useMapTabLifecycle hook (Android only,
-      // but the JS surface is platform-agnostic so the hook is portable).
       setActive(active: boolean) {
         const tag = getReactTagSafe();
         if (tag == null) return;
@@ -345,23 +347,18 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         if (tag == null) return;
         (NativeMapViewManager as any).forceRedraw?.(tag);
       },
-      // Private: lets useMapTabLifecycle resolve the tag without re-traversing
-      // findNodeHandle on every focus change.
       __getReactTag: () => getReactTagSafe(),
     }), [getReactTag, getReactTagSafe]);
 
+    // ------------------------------------------------------------------
+    // Per-marker ref wiring (unchanged)
+    // ------------------------------------------------------------------
     useEffect(() => {
       parsed.markerRefs.forEach((markerRef, markerId) => {
         setMarkerRef(markerRef, {
-          showCallout() {
-            NativeMapViewManager.showMarkerCallout(getReactTag(), markerId);
-          },
-          hideCallout() {
-            NativeMapViewManager.hideMarkerCallout(getReactTag(), markerId);
-          },
-          redraw() {
-            NativeMapViewManager.redrawMarker(getReactTag(), markerId);
-          },
+          showCallout() { NativeMapViewManager.showMarkerCallout(getReactTag(), markerId); },
+          hideCallout() { NativeMapViewManager.hideMarkerCallout(getReactTag(), markerId); },
+          redraw() { NativeMapViewManager.redrawMarker(getReactTag(), markerId); },
           animateMarkerToCoordinate(coordinate, durationOrOptions) {
             NativeMapViewManager.animateMarkerToCoordinate(
               getReactTag(),
@@ -372,44 +369,256 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
           },
         });
       });
-
       return () => {
         parsed.markerRefs.forEach(markerRef => setMarkerRef(markerRef, null));
       };
     }, [getReactTag, parsed]);
 
+    // ==================================================================
+    // Clustering pipeline
+    // ==================================================================
+
+    const clusteringEnabled = clusterConfig?.enabled !== false && !!clusterConfig;
+    const ignoreSet = useMemo(
+      () => new Set(clusterConfig?.ignoreClusterIds ?? []),
+      [clusterConfig?.ignoreClusterIds],
+    );
+    const clusterRadius = clusterConfig?.radius ?? DEFAULT_CLUSTER_RADIUS;
+    const forceJS = clusterConfig?.forceJS ?? false;
+
+    /** Current visible region — tracked from onRegionChange events. */
+    const [currentRegion, setCurrentRegion] = useState<Region | undefined>(
+      region ?? initialRegion,
+    );
+    /** Viewport pixel size — tracked from container onLayout. */
+    const [viewport, setViewport] = useState<{ width: number; height: number }>({
+      width: 0,
+      height: 0,
+    });
+    /** Latest computed clusters. */
+    const [clusters, setClusters] = useState<Cluster[]>([]);
+
+    /**
+     * Splits the marker meta map into "passthrough" (kept as-is, e.g. items
+     * the consumer pinned via ignoreClusterIds) and "clusterable" inputs.
+     */
+    const { clusterablePoints, passthroughIds } = useMemo(() => {
+      if (!clusteringEnabled) return { clusterablePoints: [], passthroughIds: new Set<string>() };
+      const cpoints: ClusterPoint[] = [];
+      const pass = new Set<string>();
+      for (const meta of parsed.markerMeta.values()) {
+        if (ignoreSet.has(meta.id)) {
+          pass.add(meta.id);
+        } else {
+          cpoints.push({
+            id: meta.id,
+            coordinate: meta.coordinate,
+            data: meta.data,
+            title: meta.title,
+          });
+        }
+      }
+      return { clusterablePoints: cpoints, passthroughIds: pass };
+    }, [clusteringEnabled, parsed.markerMeta, ignoreSet]);
+
+    /**
+     * Run clustering: tries native first (Android/iOS only when supported)
+     * and gracefully falls back to the pure-JS engine.
+     */
+    const recompute = useCallback(async () => {
+      if (!clusteringEnabled) return;
+      if (clusterablePoints.length === 0 && passthroughIds.size === 0) {
+        setClusters([]);
+        return;
+      }
+      if (!currentRegion || viewport.width === 0 || viewport.height === 0) {
+        return;
+      }
+
+      // --- Native acceleration path -------------------------------------
+      let nativeBuckets: EngineCluster[] | undefined;
+      if (!forceJS && (Platform.OS === 'android' || Platform.OS === 'ios')) {
+        const tag = getReactTagSafe();
+        const compute = (NativeMapViewManager as any).computeClusters;
+        if (tag != null && typeof compute === 'function' && clusterablePoints.length > 0) {
+          try {
+            const minimal = clusterablePoints.map(p => ({
+              id: p.id,
+              latitude: p.coordinate.latitude,
+              longitude: p.coordinate.longitude,
+            }));
+            const buckets = await compute(tag, minimal, clusterRadius);
+            if (Array.isArray(buckets)) {
+              const jsResult = clusterPoints({
+                points: clusterablePoints,
+                region: currentRegion,
+                viewport,
+                radius: clusterRadius,
+                nativeBuckets: buckets.map((b: any) => ({
+                  bucketId: b.bucketId,
+                  markerIds: b.markerIds,
+                  coordinate: { latitude: b.latitude, longitude: b.longitude },
+                })),
+              });
+              nativeBuckets = jsResult;
+            }
+          } catch {
+            // Fall through to the JS engine below.
+          }
+        }
+      }
+
+      // --- JS fallback / primary path -----------------------------------
+      const result = nativeBuckets ?? clusterPoints({
+        points: clusterablePoints,
+        region: currentRegion,
+        viewport,
+        radius: clusterRadius,
+      });
+      setClusters(result);
+    }, [
+      clusteringEnabled,
+      clusterablePoints,
+      passthroughIds.size,
+      currentRegion,
+      viewport,
+      clusterRadius,
+      forceJS,
+      getReactTagSafe,
+    ]);
+
+    useEffect(() => {
+      recompute();
+    }, [recompute]);
+
+    // ------------------------------------------------------------------
+    // Build the native marker list — clustered or passthrough
+    // ------------------------------------------------------------------
+    const renderClusterFn = clusterConfig?.renderCluster;
+    const { nativeMarkers, clusterSnapshots, clusterById } = useMemo(() => {
+      if (!clusteringEnabled) {
+        return {
+          nativeMarkers: parsed.markers,
+          clusterSnapshots: [] as MarkerSnapshot[],
+          clusterById: new Map<string, Cluster>(),
+        };
+      }
+      const out: NativeMarker[] = [];
+      const snaps: MarkerSnapshot[] = [];
+      const byId = new Map<string, Cluster>();
+
+      // 1) ignored markers pass through verbatim, with their original
+      //    native marker entry + any custom snapshot children.
+      for (const m of parsed.markers) {
+        if (passthroughIds.has(m.id)) out.push(m);
+      }
+
+      // 2) cluster results become synthetic markers.
+      for (const c of clusters) {
+        const id = `${CLUSTER_MARKER_PREFIX}${c.id}`;
+        byId.set(id, c);
+        out.push({
+          id,
+          latitude: c.coordinate.latitude,
+          longitude: c.coordinate.longitude,
+          tappable: true,
+          tracksViewChanges: true,
+          anchor: { x: 0.5, y: 0.5 },
+        } as NativeMarker);
+        const node = renderClusterFn
+          ? renderClusterFn(c)
+          : <DefaultClusterBubble cluster={c} />;
+        snaps.push({ id, children: node });
+      }
+      return { nativeMarkers: out, clusterSnapshots: snaps, clusterById: byId };
+    }, [clusteringEnabled, clusters, parsed.markers, passthroughIds, renderClusterFn]);
+
+    // Combine "real" snapshots (only those that survive passthrough) with cluster snapshots.
+    const allSnapshots = useMemo(() => {
+      if (!clusteringEnabled) return parsed.markerSnapshots;
+      const live = parsed.markerSnapshots.filter(s => passthroughIds.has(s.id));
+      return [...live, ...clusterSnapshots];
+    }, [clusteringEnabled, parsed.markerSnapshots, clusterSnapshots, passthroughIds]);
+
+    // ------------------------------------------------------------------
+    // Marker view (snapshot) wiring
+    // ------------------------------------------------------------------
     const setMarkerView = useCallback((markerId: string, node: View | null) => {
       if (!node) {
         markerViewTags.current.delete(markerId);
         return;
       }
       const markerViewTag = findNodeHandle(node);
-      if (markerViewTag == null) {
-        return;
-      }
+      if (markerViewTag == null) return;
       markerViewTags.current.set(markerId, markerViewTag);
       try {
         NativeMapViewManager.setMarkerView(getReactTag(), markerId, markerViewTag);
       } catch {
-        // The map ref can be a frame behind the marker snapshot view during initial mount.
+        /* see below */
       }
     }, [getReactTag]);
 
     useEffect(() => {
-      parsed.markerSnapshots.forEach(({ id }) => {
+      allSnapshots.forEach(({ id }) => {
         const markerViewTag = markerViewTags.current.get(id);
         if (markerViewTag != null) {
           NativeMapViewManager.setMarkerView(getReactTag(), id, markerViewTag);
         }
       });
-    }, [getReactTag, parsed.markerSnapshots, parsed.markers]);
+    }, [getReactTag, allSnapshots, nativeMarkers]);
+
+    // ------------------------------------------------------------------
+    // Container layout — tracks viewport pixel dimensions
+    // ------------------------------------------------------------------
+    const onContainerLayout = useCallback((e: LayoutChangeEvent) => {
+      const { width, height } = e.nativeEvent.layout;
+      setViewport(prev => (prev.width === width && prev.height === height ? prev : { width, height }));
+    }, []);
+
+    // ------------------------------------------------------------------
+    // Marker press dispatch — routes cluster taps to onClusterPress
+    // ------------------------------------------------------------------
+    const handleMarkerPress = useCallback(
+      (event: EventPayload<{ id: string; coordinate: Coordinate }>) => {
+        const id = event.nativeEvent.id;
+        if (clusteringEnabled && id.startsWith(CLUSTER_MARKER_PREFIX)) {
+          const cluster = clusterById.get(id);
+          if (cluster) {
+            clusterConfig?.onClusterPress?.(cluster);
+          }
+          return;
+        }
+        parsed.markerPressHandlers.get(id)?.({ coordinate: event.nativeEvent.coordinate });
+      },
+      [clusteringEnabled, clusterById, clusterConfig, parsed.markerPressHandlers],
+    );
+
+    // ------------------------------------------------------------------
+    // Region tracking — needed to recluster on zoom
+    // ------------------------------------------------------------------
+    const handleRegionChange = useCallback(
+      (event: EventPayload<{ region: Region; details?: RegionChangeDetails }>) => {
+        if (clusteringEnabled) setCurrentRegion(event.nativeEvent.region);
+        onRegionChange?.(event.nativeEvent.region, event.nativeEvent.details);
+      },
+      [clusteringEnabled, onRegionChange],
+    );
+    const handleRegionChangeComplete = useCallback(
+      (event: EventPayload<{ region: Region; details?: RegionChangeDetails }>) => {
+        if (clusteringEnabled) setCurrentRegion(event.nativeEvent.region);
+        onRegionChangeComplete?.(event.nativeEvent.region, event.nativeEvent.details);
+      },
+      [clusteringEnabled, onRegionChangeComplete],
+    );
 
     return (
-      <>
+      <View style={styles.container} onLayout={onContainerLayout}>
         <NativeMapView
           ref={nativeRef}
           {...props}
-          markers={parsed.markers}
+          initialRegion={initialRegion}
+          region={region}
+          markers={nativeMarkers}
           polylines={parsed.polylines}
           circles={parsed.circles}
           customMapStyle={customMapStyle ? JSON.stringify(customMapStyle) : undefined}
@@ -419,45 +628,37 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
           onLongPress={(event: EventPayload<{ coordinate: Coordinate }>) =>
             onLongPress?.({ coordinate: event.nativeEvent.coordinate })
           }
-          onRegionChange={(event: EventPayload<{ region: Region; details?: RegionChangeDetails }>) =>
-            onRegionChange?.(event.nativeEvent.region, event.nativeEvent.details)
-          }
-          onRegionChangeComplete={(event: EventPayload<{ region: Region; details?: RegionChangeDetails }>) =>
-            onRegionChangeComplete?.(event.nativeEvent.region, event.nativeEvent.details)
-          }
+          onRegionChange={handleRegionChange}
+          onRegionChangeComplete={handleRegionChangeComplete}
           onMapReady={() => onMapReady?.()}
           onUserLocationChange={(event: EventPayload<{ coordinate: Coordinate }>) =>
             onUserLocationChange?.({ coordinate: event.nativeEvent.coordinate })
           }
-          onMarkerPress={(event: EventPayload<{ id: string; coordinate: Coordinate }>) =>
-            parsed.markerPressHandlers
-              .get(event.nativeEvent.id)
-              ?.({ coordinate: event.nativeEvent.coordinate })
-          }
+          onMarkerPress={handleMarkerPress}
           onMarkerSelect={(event: EventPayload<{ id: string; coordinate: Coordinate }>) =>
-            parsed.markerSelectHandlers
-              .get(event.nativeEvent.id)
-              ?.({ coordinate: event.nativeEvent.coordinate })
+            parsed.markerSelectHandlers.get(event.nativeEvent.id)?.({
+              coordinate: event.nativeEvent.coordinate,
+            })
           }
           onMarkerDeselect={(event: EventPayload<{ id: string; coordinate: Coordinate }>) =>
-            parsed.markerDeselectHandlers
-              .get(event.nativeEvent.id)
-              ?.({ coordinate: event.nativeEvent.coordinate })
+            parsed.markerDeselectHandlers.get(event.nativeEvent.id)?.({
+              coordinate: event.nativeEvent.coordinate,
+            })
           }
           onMarkerDragStart={(event: EventPayload<{ id: string; coordinate: Coordinate }>) =>
-            parsed.markerDragStartHandlers
-              .get(event.nativeEvent.id)
-              ?.({ coordinate: event.nativeEvent.coordinate })
+            parsed.markerDragStartHandlers.get(event.nativeEvent.id)?.({
+              coordinate: event.nativeEvent.coordinate,
+            })
           }
           onMarkerDrag={(event: EventPayload<{ id: string; coordinate: Coordinate }>) =>
-            parsed.markerDragHandlers
-              .get(event.nativeEvent.id)
-              ?.({ coordinate: event.nativeEvent.coordinate })
+            parsed.markerDragHandlers.get(event.nativeEvent.id)?.({
+              coordinate: event.nativeEvent.coordinate,
+            })
           }
           onMarkerDragEnd={(event: EventPayload<{ id: string; coordinate: Coordinate }>) =>
-            parsed.markerDragEndHandlers
-              .get(event.nativeEvent.id)
-              ?.({ coordinate: event.nativeEvent.coordinate })
+            parsed.markerDragEndHandlers.get(event.nativeEvent.id)?.({
+              coordinate: event.nativeEvent.coordinate,
+            })
           }
           onCalloutPress={(event: EventPayload<{ id: string }>) =>
             parsed.calloutPressHandlers.get(event.nativeEvent.id)?.()
@@ -466,10 +667,11 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
             parsed.polylinePressHandlers.get(event.nativeEvent.id)?.()
           }
           collapsable={Platform.OS === 'android' ? false : props.collapsable}
+          style={StyleSheet.absoluteFill}
         />
-        {(Platform.OS === 'android' || Platform.OS === 'ios') && parsed.markerSnapshots.length > 0 ? (
+        {(Platform.OS === 'android' || Platform.OS === 'ios') && allSnapshots.length > 0 ? (
           <View pointerEvents="none" style={styles.markerSnapshotRoot}>
-            {parsed.markerSnapshots.map(snapshot => (
+            {allSnapshots.map(snapshot => (
               <View
                 key={snapshot.id}
                 ref={node => setMarkerView(snapshot.id, node)}
@@ -487,7 +689,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
             ))}
           </View>
         ) : null}
-      </>
+      </View>
     );
   },
 );
@@ -495,12 +697,28 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
 MapView.displayName = 'RNCustomMapView';
 
 const styles = StyleSheet.create({
+  container: { flex: 1 },
   markerSnapshotRoot: {
     position: 'absolute',
     left: -10000,
     top: -10000,
     alignItems: 'flex-start',
   },
+});
+
+const defaultClusterStyles = StyleSheet.create({
+  bubble: {
+    minWidth: 38,
+    height: 38,
+    paddingHorizontal: 10,
+    borderRadius: 19,
+    backgroundColor: '#1f6feb',
+    borderWidth: 2,
+    borderColor: '#ffffff',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  text: { color: '#ffffff', fontWeight: '700', fontSize: 13 },
 });
 
 export default MapView;

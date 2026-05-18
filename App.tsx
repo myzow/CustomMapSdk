@@ -17,6 +17,7 @@ import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 
 import TabbedMapScreen from './src/screens/TabbedMapScreen';
+import ClusteringScreen from './src/screens/ClusteringScreen';
 
 const Tab = createBottomTabNavigator();
 
@@ -80,6 +81,15 @@ export default function App() {
             <TabbedMapScreen label="Tokyo" center={TOKYO} accent="#ff7b72" />
           )}
         </Tab.Screen>
+
+        <Tab.Screen
+          name="Cluster"
+          component={ClusteringScreen}
+          options={{
+            title: 'Clustering',
+            tabBarIcon: ({ color }) => tabIcon('CL', color),
+          }}
+        />
       </Tab.Navigator>
     </NavigationContainer>
   );

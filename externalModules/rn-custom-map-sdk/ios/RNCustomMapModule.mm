@@ -111,6 +111,24 @@ RCT_EXPORT_METHOD(setMarkerView:(nonnull NSNumber *)reactTag markerId:(NSString 
   });
 }
 
+// Lifecycle commands are Android-only — no-op on iOS (MapKit/GMS-iOS does
+// not exhibit the bottom-tab white-screen bug), but exposed for cross-platform
+// JS calls to remain symmetric.
+RCT_EXPORT_METHOD(setActive:(nonnull NSNumber *)reactTag active:(BOOL)active) {}
+RCT_EXPORT_METHOD(forceRedraw:(nonnull NSNumber *)reactTag) {}
+
+RCT_EXPORT_METHOD(computeClusters:(nonnull NSNumber *)reactTag
+                  points:(NSArray *)points
+                  radius:(double)radius
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+  [self withMap:reactTag block:^(RNCustomMapNativeView *view) {
+    NSArray *result = [view computeClustersWithPoints:points radius:radius];
+    resolve(result ?: @[]);
+  }];
+}
+
 - (void)withMap:(NSNumber *)reactTag block:(void (^)(RNCustomMapNativeView *view))block
 {
   dispatch_async(dispatch_get_main_queue(), ^{

@@ -83,6 +83,31 @@ export interface Spec extends TurboModule {
   // Forces a layout + GL-surface refresh on the embedded MapView. Used by
   // the useMapTabLifecycle hook to defeat the API 30/33 white-screen bug.
   forceRedraw(reactTag: Int32): void;
+
+  /**
+   * Native-accelerated cluster bucketing. Groups the supplied points by
+   * pixel-space grid against the current map projection.
+   *
+   * Returns an array of buckets — only id groupings and the cell center.
+   * JS enriches each bucket with marker.data so renderCluster() retains
+   * full access to anything the marker carries.
+   *
+   * The points array must contain only what's needed for projection:
+   * { id, latitude, longitude }. Keeping the payload minimal avoids
+   * bridge-serialization cost for data that already lives in JS.
+   */
+  computeClusters(
+    reactTag: Int32,
+    points: Array<{ id: string; latitude: Double; longitude: Double }>,
+    radius: Double,
+  ): Promise<
+    Array<{
+      bucketId: string;
+      markerIds: Array<string>;
+      latitude: Double;
+      longitude: Double;
+    }>
+  >;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('RNCustomMapViewManager');

@@ -46,6 +46,7 @@
 - (void)redrawMarker:(NSString *)markerId;
 - (void)animateMarkerToCoordinate:(NSString *)markerId coordinate:(NSDictionary *)coordinate options:(NSDictionary *)options;
 - (void)setMarkerView:(UIView *)markerView markerId:(NSString *)markerId;
+- (NSArray<NSDictionary *> *)computeClustersWithPoints:(NSArray<NSDictionary *> *)points radius:(double)radius;
 
 @end
 

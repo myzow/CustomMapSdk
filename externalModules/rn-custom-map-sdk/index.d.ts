@@ -4,6 +4,7 @@ export { default as Callout } from './src/Callout';
 export { default as Polyline } from './src/Polyline';
 export { default as Circle } from './src/Circle';
 export { useMapTabLifecycle } from './src/hooks/useMapTabLifecycle';
+export { clusterPoints } from './src/clustering/cluster';
 export * from './src/types';
 export { MAP_TYPES, PROVIDERS } from './src/constants';
 export { default } from './src/MapView';

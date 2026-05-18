@@ -76,6 +76,48 @@
 - P3: integration test that mounts 3 maps in a tab navigator and asserts
   no `null` resolution warnings in logcat.
 
+---
+
+## Update — Marker Clustering (Jan 2026)
+
+### What was added
+- **`<Marker data={…} userData={…}>`** — arbitrary JS-only payload, never
+  bridged, surfaces verbatim at `cluster.markers[i].data`.
+- **`<MapView clusterConfig={…}>`** with `enabled`, `ignoreClusterIds`,
+  `radius`, `renderCluster`, `onClusterPress`, `forceJS`.
+- **Cluster** type: `{ id, coordinate, pointCount, markerIds, markers[] }`
+  where each `markers[i]` carries `{ id, coordinate, data, title }`.
+- **`src/clustering/cluster.ts`** — pure-JS O(n) pixel-space grid engine
+  with native-bucket fast-path.
+- **Android native acceleration** — `computeClusters` on `RNCustomMapModule`
+  uses `googleMap.getProjection().toScreenLocation(...)` for pixel-space
+  bucketing. Returns id groupings only; JS enriches with `data`.
+- **iOS native acceleration** — `computeClustersWithPoints:radius:` on
+  `RNCustomMapNativeView` uses `GMSProjection pointForCoordinate:` —
+  same algorithm/contract as Android.
+- **JS fallback** — automatic when native call fails / unavailable / forced.
+- **Demo** — `src/screens/ClusteringScreen.tsx` wired as a 4th bottom-tab,
+  showcasing image-stacked cluster bubbles drawn from `marker.data.avatar`.
+
+### Files added/modified
+- `externalModules/rn-custom-map-sdk/src/clustering/cluster.ts` (new)
+- `externalModules/rn-custom-map-sdk/src/MapView.tsx` (full clustering pipeline)
+- `externalModules/rn-custom-map-sdk/src/types.ts` (`Cluster`, `ClusterConfig`, marker `data`)
+- `externalModules/rn-custom-map-sdk/spec/NativeRNCustomMapViewManager.ts` (`computeClusters`)
+- `externalModules/rn-custom-map-sdk/android/.../RNCustomMapModule.java` (native impl)
+- `externalModules/rn-custom-map-sdk/ios/RNCustomMapView.h/.mm` (native impl)
+- `externalModules/rn-custom-map-sdk/ios/RNCustomMapModule.mm` (`RCT_EXPORT_METHOD`)
+- `externalModules/rn-custom-map-sdk/index.tsx` / `index.d.ts` (export `clusterPoints`)
+- `src/screens/ClusteringScreen.tsx` (new)
+- `App.tsx` (4th tab)
+- `CLUSTERING.md` (full write-up)
+
+### Verification
+- `npx tsc --noEmit` ✓ clean
+- ESLint on changed files ✓ clean
+- Java/Obj-C compilation requires `./gradlew clean && yarn android` (Android)
+  or `pod install && yarn ios` (iOS) on the user's machine.
+
 ## Files
 - `externalModules/rn-custom-map-sdk/android/src/main/java/com/rncustommap/RNCustomMapView.java`
 - `externalModules/rn-custom-map-sdk/android/src/main/java/com/rncustommap/RNCustomMapModule.java`

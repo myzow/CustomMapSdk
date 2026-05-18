@@ -78,6 +78,12 @@ export interface MapViewProps extends Omit<ViewProps, 'children'> {
   pitchEnabled?: boolean;
   minZoomLevel?: number;
   maxZoomLevel?: number;
+  /**
+   * Enables marker clustering. When `enabled` is true (default if the object
+   * is present), markers are grouped on every camera idle. See
+   * {@link ClusterConfig}.
+   */
+  clusterConfig?: ClusterConfig;
   onPress?: (event: { coordinate: Coordinate }) => void;
   onLongPress?: (event: { coordinate: Coordinate }) => void;
   onRegionChange?: (region: Region, details?: RegionChangeDetails) => void;
@@ -85,6 +91,50 @@ export interface MapViewProps extends Omit<ViewProps, 'children'> {
   onMapReady?: () => void;
   onUserLocationChange?: (event: { coordinate: Coordinate }) => void;
 }
+
+/**
+ * A cluster of markers produced by the clustering engine. Singleton clusters
+ * (pointCount === 1) are emitted for markers that did not merge with anyone
+ * — including markers whose id is in `clusterConfig.ignoreClusterIds`.
+ */
+export type Cluster = {
+  id: string;
+  coordinate: Coordinate;
+  pointCount: number;
+  markerIds: string[];
+  markers: Array<{
+    id: string;
+    coordinate: Coordinate;
+    data?: any;
+    title?: string;
+  }>;
+};
+
+export type ClusterConfig = {
+  /** Master switch. Defaults to true when the object is supplied. */
+  enabled?: boolean;
+  /**
+   * Marker ids that should never be folded into a cluster. They pass through
+   * as ordinary markers regardless of zoom.
+   */
+  ignoreClusterIds?: ReadonlyArray<string>;
+  /** Cluster radius in screen pixels. Default 60. */
+  radius?: number;
+  /**
+   * Renders the visual for a cluster (any pointCount, including 1). Return
+   * a React node; it will be snapshotted into the native marker pipeline.
+   * When omitted, a default bubble with the point count is rendered.
+   */
+  renderCluster?: (cluster: Cluster) => React.ReactNode;
+  /** Fires when the user taps a cluster (including singletons). */
+  onClusterPress?: (cluster: Cluster) => void;
+  /**
+   * Force the JS path even when native acceleration is available. Useful
+   * for debugging or to keep behavior identical across platforms.
+   * Defaults to false.
+   */
+  forceJS?: boolean;
+};
 
 export interface MarkerProps {
   id?: string;
@@ -105,6 +155,17 @@ export interface MarkerProps {
   opacity?: number;
   tappable?: boolean;
   tracksViewChanges?: boolean;
+  /**
+   * Arbitrary payload carried with the marker. Available on every cluster
+   * member as `cluster.markers[i].data` — use it to surface images, names,
+   * counts, anything else you need inside renderCluster().
+   *
+   * Stored in JS only. Never bridged to native (no serialization cost,
+   * no shape restriction).
+   */
+  data?: any;
+  /** Alias of {@link data} for parity with libraries that use this name. */
+  userData?: any;
   children?: React.ReactNode;
   onPress?: (event?: { coordinate: Coordinate }) => void;
   onSelect?: (event?: { coordinate: Coordinate }) => void;

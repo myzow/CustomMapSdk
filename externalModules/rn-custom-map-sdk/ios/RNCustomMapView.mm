@@ -623,6 +623,69 @@ using namespace facebook::react;
   return MAX(0, MIN(21, log2(360.0 / longitudeDelta)));
 }
 
+#pragma mark - Clustering acceleration
+
+/**
+ * Pixel-space grid clustering using GMSMapView's projection. Returns
+ * id groupings only — JS enriches with marker.data so renderCluster()
+ * keeps full access to anything the marker carries (images, names, etc).
+ *
+ * O(n). Always called on the main queue (the projection is main-thread-only).
+ */
+- (NSArray<NSDictionary *> *)computeClustersWithPoints:(NSArray<NSDictionary *> *)points
+                                                radius:(double)radius
+{
+  if (!self.mapView || points.count == 0) {
+    return @[];
+  }
+  double r = radius > 0 ? radius : 60.0;
+  GMSProjection *projection = self.mapView.projection;
+
+  NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *grid = [NSMutableDictionary dictionary];
+  NSMutableDictionary<NSString *, NSMutableArray<NSNumber *> *> *latSums = [NSMutableDictionary dictionary];
+  NSMutableDictionary<NSString *, NSMutableArray<NSNumber *> *> *lngSums = [NSMutableDictionary dictionary];
+
+  for (NSDictionary *p in points) {
+    NSString *pid = p[@"id"];
+    if (![pid isKindOfClass:[NSString class]]) continue;
+    double lat = [p[@"latitude"] doubleValue];
+    double lng = [p[@"longitude"] doubleValue];
+    CLLocationCoordinate2D coord = CLLocationCoordinate2DMake(lat, lng);
+    CGPoint screen = [projection pointForCoordinate:coord];
+
+    NSInteger cx = (NSInteger)floor(screen.x / r);
+    NSInteger cy = (NSInteger)floor(screen.y / r);
+    NSString *key = [NSString stringWithFormat:@"%ld:%ld", (long)cx, (long)cy];
+
+    NSMutableArray<NSString *> *bucket = grid[key];
+    if (!bucket) {
+      bucket = [NSMutableArray array];
+      grid[key] = bucket;
+      latSums[key] = [NSMutableArray array];
+      lngSums[key] = [NSMutableArray array];
+    }
+    [bucket addObject:pid];
+    [latSums[key] addObject:@(lat)];
+    [lngSums[key] addObject:@(lng)];
+  }
+
+  NSMutableArray<NSDictionary *> *out = [NSMutableArray arrayWithCapacity:grid.count];
+  for (NSString *key in grid) {
+    NSMutableArray<NSString *> *ids = grid[key];
+    double latSum = 0, lngSum = 0;
+    for (NSNumber *n in latSums[key]) latSum += n.doubleValue;
+    for (NSNumber *n in lngSums[key]) lngSum += n.doubleValue;
+    NSUInteger count = ids.count;
+    [out addObject:@{
+      @"bucketId": [@"grid:" stringByAppendingString:key],
+      @"markerIds": [ids copy],
+      @"latitude": @(latSum / (double)count),
+      @"longitude": @(lngSum / (double)count),
+    }];
+  }
+  return out;
+}
+
 @end
 
 static NSString *RNCustomMapNSString(const std::string &value)

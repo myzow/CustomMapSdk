@@ -1,20 +1,31 @@
 package com.rncustommap;
 
+import android.graphics.Point;
 import android.util.Log;
 import android.view.View;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.UIManager;
 import com.facebook.react.bridge.UiThreadUtil;
+import com.facebook.react.bridge.WritableArray;
+import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.bridge.WritableNativeMap;
 import com.facebook.react.module.annotations.ReactModule;
 import com.facebook.react.uimanager.UIManagerHelper;
+import com.google.android.gms.maps.Projection;
+import com.google.android.gms.maps.model.LatLng;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * NativeModule entry point for rn-custom-map-sdk imperative commands.
@@ -200,6 +211,83 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
   @Override
   public void forceRedraw(double reactTag) {
     withMap((int) reactTag, "forceRedraw", RNCustomMapView::forceRedraw);
+  }
+
+  // -------------------- Clustering acceleration --------------------
+
+  /**
+   * Native-accelerated pixel-space cluster bucketing using the live
+   * GoogleMap projection. Returns id groupings only (no payload data);
+   * JS enriches with marker.data so renderCluster() retains full access.
+   *
+   * Algorithm: project each point to screen pixels, bin into a grid of
+   * cells of size {@code radius} px, emit one bucket per non-empty cell.
+   * O(n) — fast for tens of thousands of points.
+   */
+  @Override
+  public void computeClusters(double reactTag, ReadableArray points, double radius, Promise promise) {
+    UiThreadUtil.runOnUiThread(() -> {
+      RNCustomMapView view = resolveMap((int) reactTag);
+      if (view == null || view.googleMap == null) {
+        promise.resolve(Arguments.createArray());
+        return;
+      }
+      double r = radius > 0 ? radius : 60d;
+      Projection projection = view.googleMap.getProjection();
+
+      Map<String, List<int[]>> grid = new HashMap<>();   // cellKey -> list of point indices
+      Map<String, double[]> sums = new HashMap<>();      // cellKey -> [latSum, lngSum]
+      List<String> ids = new ArrayList<>(points.size());
+      List<LatLng> coords = new ArrayList<>(points.size());
+
+      for (int i = 0; i < points.size(); i++) {
+        ReadableMap p = points.getMap(i);
+        if (p == null) continue;
+        String id = p.hasKey("id") ? p.getString("id") : null;
+        if (id == null) continue;
+        double lat = p.getDouble("latitude");
+        double lng = p.getDouble("longitude");
+        ids.add(id);
+        LatLng ll = new LatLng(lat, lng);
+        coords.add(ll);
+
+        Point screen = projection.toScreenLocation(ll);
+        // Skip points the projection couldn't place (very rare).
+        if (screen == null) continue;
+        int cx = (int) Math.floor(screen.x / r);
+        int cy = (int) Math.floor(screen.y / r);
+        String key = cx + ":" + cy;
+
+        List<int[]> bucket = grid.get(key);
+        if (bucket == null) {
+          bucket = new ArrayList<>();
+          grid.put(key, bucket);
+          sums.put(key, new double[] {0d, 0d});
+        }
+        bucket.add(new int[] {ids.size() - 1});
+        double[] s = sums.get(key);
+        s[0] += lat;
+        s[1] += lng;
+      }
+
+      WritableArray out = Arguments.createArray();
+      for (Map.Entry<String, List<int[]>> e : grid.entrySet()) {
+        List<int[]> members = e.getValue();
+        WritableMap bucket = Arguments.createMap();
+        bucket.putString("bucketId", "grid:" + e.getKey());
+        WritableArray markerIds = Arguments.createArray();
+        for (int[] idx : members) {
+          markerIds.pushString(ids.get(idx[0]));
+        }
+        bucket.putArray("markerIds", markerIds);
+        double[] s = sums.get(e.getKey());
+        int count = members.size();
+        bucket.putDouble("latitude", s[0] / count);
+        bucket.putDouble("longitude", s[1] / count);
+        out.pushMap(bucket);
+      }
+      promise.resolve(out);
+    });
   }
 
   // -------------------- Marker methods --------------------
