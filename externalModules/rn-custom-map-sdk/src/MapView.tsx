@@ -282,37 +282,73 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     const getReactTag = useCallback(() => {
       const tag = findNodeHandle(nativeRef.current);
       if (tag == null) {
-        throw new Error('RNCustomMapView native ref is not mounted.');
+        // Do NOT throw — edge-indicator callbacks frequently fire on the
+        // very first frame before findNodeHandle resolves. Returning -1
+        // lets the native module's resolveMap() short-circuit cleanly and
+        // log a warning instead of crashing the JS thread.
+        return -1;
       }
       return tag;
     }, []);
 
+    const getReactTagSafe = useCallback(() => {
+      const tag = getReactTag();
+      return tag >= 0 ? tag : null;
+    }, [getReactTag]);
+
     useImperativeHandle(ref, () => ({
       animateToRegion(region: Region, duration = DEFAULT_DURATION) {
-        NativeMapViewManager.animateToRegion(getReactTag(), region, duration);
+        const tag = getReactTagSafe();
+        if (tag == null) return;
+        NativeMapViewManager.animateToRegion(tag, region, duration);
       },
       animateToCoordinate(coordinate: Coordinate, duration = DEFAULT_DURATION) {
-        NativeMapViewManager.animateToCoordinate(getReactTag(), coordinate, duration);
+        const tag = getReactTagSafe();
+        if (tag == null) return;
+        NativeMapViewManager.animateToCoordinate(tag, coordinate, duration);
       },
       fitToCoordinates(coordinates, options) {
-        NativeMapViewManager.fitToCoordinates(getReactTag(), coordinates, fitOptions(options));
+        const tag = getReactTagSafe();
+        if (tag == null) return;
+        NativeMapViewManager.fitToCoordinates(tag, coordinates, fitOptions(options));
       },
       fitToElements(options) {
-        NativeMapViewManager.fitToElements(getReactTag(), fitOptions(options));
+        const tag = getReactTagSafe();
+        if (tag == null) return;
+        NativeMapViewManager.fitToElements(tag, fitOptions(options));
       },
       fitToSuppliedMarkers(markers, options) {
-        NativeMapViewManager.fitToSuppliedMarkers(getReactTag(), markers, fitOptions(options));
+        const tag = getReactTagSafe();
+        if (tag == null) return;
+        NativeMapViewManager.fitToSuppliedMarkers(tag, markers, fitOptions(options));
       },
       getCamera() {
         return NativeMapViewManager.getCamera(getReactTag()) as Promise<Camera>;
       },
       setCamera(camera: Camera, duration = DEFAULT_DURATION) {
-        NativeMapViewManager.setCamera(getReactTag(), camera, duration);
+        const tag = getReactTagSafe();
+        if (tag == null) return;
+        NativeMapViewManager.setCamera(tag, camera, duration);
       },
       getMarkers() {
         return NativeMapViewManager.getMarkers(getReactTag());
       },
-    }), [getReactTag]);
+      // Lifecycle commands — used by useMapTabLifecycle hook (Android only,
+      // but the JS surface is platform-agnostic so the hook is portable).
+      setActive(active: boolean) {
+        const tag = getReactTagSafe();
+        if (tag == null) return;
+        (NativeMapViewManager as any).setActive?.(tag, active);
+      },
+      forceRedraw() {
+        const tag = getReactTagSafe();
+        if (tag == null) return;
+        (NativeMapViewManager as any).forceRedraw?.(tag);
+      },
+      // Private: lets useMapTabLifecycle resolve the tag without re-traversing
+      // findNodeHandle on every focus change.
+      __getReactTag: () => getReactTagSafe(),
+    }), [getReactTag, getReactTagSafe]);
 
     useEffect(() => {
       parsed.markerRefs.forEach((markerRef, markerId) => {

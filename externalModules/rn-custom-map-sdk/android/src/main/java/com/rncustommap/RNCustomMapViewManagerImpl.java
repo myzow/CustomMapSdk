@@ -45,29 +45,24 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.WeakHashMap;
 
 public final class RNCustomMapViewManagerImpl {
-  private static final WeakHashMap<RNCustomMapView, Boolean> VIEWS = new WeakHashMap<>();
-
+  // NOTE: View lookup now lives on RNCustomMapView.viewRegistry (populated in
+  // setId, see RNCustomMapView.java). These methods are kept as thin
+  // back-compat shims so any callers outside the Module continue to work.
   private RNCustomMapViewManagerImpl() {}
 
   static void register(RNCustomMapView view) {
-    VIEWS.put(view, true);
+    // no-op: RNCustomMapView.setId() handles registration synchronously.
   }
 
   static void unregister(RNCustomMapView view) {
-    VIEWS.remove(view);
+    // no-op: RNCustomMapView.destroy() handles removal.
   }
 
   @Nullable
   static RNCustomMapView findViewByTag(int reactTag) {
-    for (RNCustomMapView view : VIEWS.keySet()) {
-      if (view.getId() == reactTag) {
-        return view;
-      }
-    }
-    return null;
+    return RNCustomMapView.findViewByTag(reactTag);
   }
 
   static void setRegion(RNCustomMapView view, @Nullable ReadableMap region, boolean initial) {

@@ -165,6 +165,18 @@ export interface MapViewMethods {
   getCamera(): Promise<Camera>;
   setCamera(camera: Camera, duration?: number): void;
   getMarkers(): Promise<MarkerResponse[]>;
+  /**
+   * Bring the embedded Android MapView to RESUMED / PAUSED state.
+   * Mainly used by {@link useMapTabLifecycle}. No-op on iOS.
+   */
+  setActive(active: boolean): void;
+  /**
+   * Force a layout + GL-surface refresh. Used to defeat the white-screen
+   * bug on Android API 30/33 after a tab refocus. No-op on iOS.
+   */
+  forceRedraw(): void;
+  /** @internal */
+  __getReactTag?: () => number | null;
 }
 
 export type NativeMarker = {

@@ -16,6 +16,19 @@ import com.facebook.react.bridge.WritableNativeMap;
 import com.facebook.react.module.annotations.ReactModule;
 import com.facebook.react.uimanager.UIManagerHelper;
 
+/**
+ * NativeModule entry point for rn-custom-map-sdk imperative commands.
+ *
+ * <p>View resolution uses a two-tier lookup:
+ *
+ * <ol>
+ *   <li><b>Static view registry</b> on {@link RNCustomMapView#findViewByTag(int)}
+ *       — populated synchronously in setId(). This is the path that fixes the
+ *       edge-indicator "ref doesn't reach the view" bug.</li>
+ *   <li><b>UIManager fallback</b> — used only if (1) misses, which can happen
+ *       for views whose id has been re-assigned during a reparent.</li>
+ * </ol>
+ */
 @ReactModule(name = RNCustomMapModule.NAME)
 public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
   public static final String NAME = NativeRNCustomMapViewManagerSpec.NAME;
@@ -32,17 +45,31 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
   }
 
   /**
-   * Resolve the RNCustomMapView for a given React tag using the canonical
-   * UIManager lookup. Works under both Paper and Fabric (New Arch),
-   * is thread-safe (we hop onto the UI thread first), and avoids the
-   * stale-state problems of a manual WeakHashMap.
+   * Resolves a mounted {@link RNCustomMapView} for a given React tag.
+   *
+   * <p>Order:
+   * <ol>
+   *   <li>Static {@code viewRegistry} — fast, lock-free, immune to UIManager
+   *       commit races.</li>
+   *   <li>{@link UIManagerHelper#getUIManagerForReactTag} — fallback that
+   *       handles reparented / re-tagged views.</li>
+   * </ol>
    */
   @Nullable
   private RNCustomMapView resolveMap(int reactTag) {
+    // Tier 1: direct registry lookup. Works regardless of caller thread or
+    // UIManager commit phase. This is the path edge-indicator callbacks
+    // take and is why animateToRegion now works from them.
+    RNCustomMapView registered = RNCustomMapView.findViewByTag(reactTag);
+    if (registered != null) {
+      return registered;
+    }
+
+    // Tier 2: UIManager fallback for edge cases (reparented views).
     UIManager uiManager =
         UIManagerHelper.getUIManagerForReactTag(getReactApplicationContext(), reactTag);
     if (uiManager == null) {
-      Log.e(TAG, "resolveMap: no UIManager for tag=" + reactTag);
+      Log.e(TAG, "resolveMap: no view found for tag=" + reactTag);
       return null;
     }
     View view = uiManager.resolveView(reactTag);
@@ -58,8 +85,9 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
   private void withMap(int reactTag, String method, MapAction action) {
     UiThreadUtil.runOnUiThread(() -> {
       RNCustomMapView view = resolveMap(reactTag);
-      Log.d(TAG, method + " entered: tag=" + reactTag + " view=" + (view == null ? "null" : "ok"));
       if (view == null) {
+        Log.w(TAG, method + ": no view for tag=" + reactTag +
+            " (registry size=" + RNCustomMapView.registrySize() + ")");
         return;
       }
       try {
@@ -144,6 +172,34 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
       }
       promise.resolve(RNCustomMapViewManagerImpl.markers(view));
     });
+  }
+
+  // -------------------- Lifecycle methods (Issue 2 fix) --------------------
+
+  /**
+   * Called from the JS hook {@code useMapTabLifecycle} when a tab gains or
+   * loses focus. {@code active=true} resumes the embedded MapView (creating
+   * the GL surface if needed); {@code active=false} pauses it.
+   */
+  @Override
+  public void setActive(double reactTag, boolean active) {
+    withMap((int) reactTag, "setActive", view -> {
+      if (active) {
+        view.onHostResume();
+      } else {
+        view.onHostPause();
+      }
+    });
+  }
+
+  /**
+   * Forces the embedded MapView to re-layout and refresh its GL surface.
+   * Used by the JS hook on tab focus to defeat the API 30/33 white-screen
+   * bug that occurs after a detach/reattach cycle.
+   */
+  @Override
+  public void forceRedraw(double reactTag) {
+    withMap((int) reactTag, "forceRedraw", RNCustomMapView::forceRedraw);
   }
 
   // -------------------- Marker methods --------------------

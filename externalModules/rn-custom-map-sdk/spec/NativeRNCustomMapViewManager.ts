@@ -72,6 +72,17 @@ export interface Spec extends TurboModule {
     options?: MarkerAnimationOptions,
   ): void;
   setMarkerView(reactTag: Int32, markerId: string, markerViewTag: Int32): void;
+
+  // ---- Lifecycle (Issue 2 fix) ----
+  // setActive(true) brings the embedded native MapView back to RESUMED state
+  // and forces a redraw — call this on tab focus.
+  // setActive(false) pauses the native MapView — call this on tab blur to
+  // release the GL surface cleanly.
+  setActive(reactTag: Int32, active: boolean): void;
+
+  // Forces a layout + GL-surface refresh on the embedded MapView. Used by
+  // the useMapTabLifecycle hook to defeat the API 30/33 white-screen bug.
+  forceRedraw(reactTag: Int32): void;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('RNCustomMapViewManager');

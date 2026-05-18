@@ -2,39 +2,95 @@ package com.rncustommap;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
-import android.graphics.Color;
 import android.location.Location;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.MotionEvent;
 import android.widget.FrameLayout;
+
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.core.content.ContextCompat;
+
+import com.bumptech.glide.request.target.CustomTarget;
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.uimanager.events.RCTEventEmitter;
-import com.google.android.gms.maps.CameraUpdateFactory;
 import com.google.android.gms.maps.GoogleMap;
 import com.google.android.gms.maps.MapView;
 import com.google.android.gms.maps.OnMapReadyCallback;
 import com.google.android.gms.maps.model.CameraPosition;
 import com.google.android.gms.maps.model.Circle;
-import com.google.android.gms.maps.model.CircleOptions;
-import com.google.android.gms.maps.model.Dash;
-import com.google.android.gms.maps.model.Gap;
 import com.google.android.gms.maps.model.LatLng;
 import com.google.android.gms.maps.model.LatLngBounds;
 import com.google.android.gms.maps.model.Marker;
-import com.google.android.gms.maps.model.MarkerOptions;
 import com.google.android.gms.maps.model.Polyline;
-import com.google.android.gms.maps.model.PolylineOptions;
-import com.bumptech.glide.request.target.CustomTarget;
+
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Native host view for rn-custom-map-sdk.
+ *
+ * Two key fixes baked in:
+ *
+ *  1. {@link #viewRegistry} — a process-wide map from React tag → view instance,
+ *     populated synchronously in {@link #setId(int)}. The NativeModule looks up
+ *     views via {@link #findViewByTag(int)} so commands originating from edge
+ *     indicators (which can fire before the UIManager has fully committed the
+ *     shadow tree) always find the right view. This is what makes
+ *     {@code mapRef.current.animateToRegion(...)} reliable regardless of caller.
+ *
+ *  2. Explicit Android lifecycle bridging for use inside @react-navigation
+ *     bottom tabs. The Google MapView holds a GL surface that is torn down when
+ *     the view is detached from the window (which is what bottom-tabs does
+ *     when switching tabs on API 30 / 33). We forward lifecycle events from
+ *     onAttachedToWindow / onDetachedFromWindow, and additionally expose
+ *     {@link #onHostResume()} / {@link #onHostPause()} / {@link #forceRedraw()}
+ *     for the JS-side {@code useMapTabLifecycle} hook so focus changes can
+ *     drive a clean resume + surface refresh, preventing the white-screen bug.
+ */
 public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
+
+  // ------------------------------------------------------------------------
+  // View registry — Issue 1 fix
+  // ------------------------------------------------------------------------
+
+  /**
+   * Strong-ref registry keyed by React tag. Populated in {@link #setId(int)}
+   * (called by React's UI thread immediately after createViewInstance), and
+   * cleared in {@link RNCustomMapViewManager#onDropViewInstance} or when the
+   * view is finally destroyed. Kept synchronized for cross-thread safety.
+   */
+  private static final Map<Integer, RNCustomMapView> viewRegistry =
+      Collections.synchronizedMap(new HashMap<>());
+
+  /**
+   * Look up a mounted RNCustomMapView by its React tag. Returns null if the
+   * view has been dropped or never had its id assigned.
+   *
+   * <p>Prefer this over {@code UIManagerHelper.resolveView()} for commands
+   * dispatched from edge indicators, gesture handlers, or any callsite that
+   * may race with UIManager commits.
+   */
+  @Nullable
+  public static RNCustomMapView findViewByTag(int reactTag) {
+    return viewRegistry.get(reactTag);
+  }
+
+  static int registrySize() {
+    return viewRegistry.size();
+  }
+
+  // ------------------------------------------------------------------------
+  // Map fields (kept package-private to match existing ManagerImpl access)
+  // ------------------------------------------------------------------------
+
   final MapView mapView;
   @Nullable GoogleMap googleMap;
   final Map<String, Marker> markers = new HashMap<>();
@@ -43,28 +99,187 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
   final Map<String, WritableMap> markerPayloads = new HashMap<>();
   final Map<String, Boolean> markerTappables = new HashMap<>();
   final Map<String, CustomTarget<android.graphics.Bitmap>> markerIconTargets = new HashMap<>();
+
   private final List<Runnable> pending = new ArrayList<>();
   @Nullable String selectedMarkerId;
+
   private boolean lastRegionChangeWasGesture = false;
   private boolean initialRegionApplied = false;
   private float minZoom = 0f;
   private float maxZoom = 21f;
 
+  // Lifecycle bookkeeping — Issue 2 fix
+  private boolean lifecycleCreated = false;
+  private boolean lifecycleStarted = false;
+  private boolean lifecycleResumed = false;
+  private boolean lifecycleDestroyed = false;
+
+  /** True when JS has called setActive(false) (e.g. tab is blurred). */
+  private boolean tabActive = true;
+
+  private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+  // ------------------------------------------------------------------------
+  // Construction
+  // ------------------------------------------------------------------------
+
   public RNCustomMapView(ReactContext context) {
     super(context);
     mapView = new MapView(context);
-    mapView.onCreate(null);
-    mapView.onStart();
-    mapView.onResume();
+    // Create only; do NOT call onStart/onResume here. The actual start/resume
+    // is driven by onAttachedToWindow + the JS lifecycle hook, which makes
+    // the map robust across bottom-tab focus changes on API 30/33.
+    mapView.onCreate(new Bundle());
+    lifecycleCreated = true;
     addView(mapView, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
     mapView.getMapAsync(this);
   }
 
+  // ------------------------------------------------------------------------
+  // ID assignment — register synchronously so module lookups never race
+  // ------------------------------------------------------------------------
+
   @Override
-  protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
-    super.onLayout(changed, left, top, right, bottom);
-    mapView.layout(0, 0, right - left, bottom - top);
+  public void setId(int id) {
+    // RN may set id more than once during reparenting — keep the registry
+    // consistent by removing the old mapping first.
+    int previous = getId();
+    super.setId(id);
+    if (previous != NO_ID && previous != id) {
+      viewRegistry.remove(previous);
+    }
+    if (id != NO_ID) {
+      viewRegistry.put(id, this);
+    }
   }
+
+  // ------------------------------------------------------------------------
+  // Window attach / detach — drive lifecycle automatically
+  // ------------------------------------------------------------------------
+
+  @Override
+  protected void onAttachedToWindow() {
+    super.onAttachedToWindow();
+    onHostResume();
+  }
+
+  @Override
+  protected void onDetachedFromWindow() {
+    // Pause but do NOT destroy — the view may re-attach when the tab is
+    // selected again. Destruction happens in onDropViewInstance.
+    onHostPause();
+    super.onDetachedFromWindow();
+  }
+
+  // ------------------------------------------------------------------------
+  // Public lifecycle API for the JS-side hook + bottom-tab focus changes
+  // ------------------------------------------------------------------------
+
+  /**
+   * Bring the embedded Google MapView to RESUMED state. Idempotent and safe
+   * to call from any focus-effect / attach callback.
+   */
+  public void onHostResume() {
+    if (lifecycleDestroyed) {
+      return;
+    }
+    if (!lifecycleCreated) {
+      mapView.onCreate(new Bundle());
+      lifecycleCreated = true;
+    }
+    if (!lifecycleStarted) {
+      mapView.onStart();
+      lifecycleStarted = true;
+    }
+    if (!lifecycleResumed) {
+      mapView.onResume();
+      lifecycleResumed = true;
+    }
+    tabActive = true;
+    // API 30/33 in particular needs an explicit surface refresh after a
+    // detach/reattach cycle, otherwise the SurfaceView paints white. We
+    // schedule it on the next frame so the GL surface has time to recreate.
+    mainHandler.post(this::forceRedraw);
+  }
+
+  /**
+   * Move the embedded Google MapView to PAUSED state. Called automatically
+   * when the view detaches from window, or explicitly from the focus-effect
+   * hook when the tab loses focus.
+   */
+  public void onHostPause() {
+    if (lifecycleDestroyed) {
+      return;
+    }
+    if (lifecycleResumed) {
+      mapView.onPause();
+      lifecycleResumed = false;
+    }
+    if (lifecycleStarted) {
+      mapView.onStop();
+      lifecycleStarted = false;
+    }
+    tabActive = false;
+  }
+
+  /**
+   * Called once from the ViewManager when the view is being permanently
+   * destroyed. Releases all native resources and removes the view from the
+   * registry.
+   */
+  public void destroy() {
+    if (lifecycleDestroyed) {
+      return;
+    }
+    onHostPause();
+    mapView.onDestroy();
+    lifecycleDestroyed = true;
+    int id = getId();
+    if (id != NO_ID) {
+      viewRegistry.remove(id);
+    }
+  }
+
+  /**
+   * Force the embedded MapView to re-layout and invalidate its GL surface.
+   * This is the workaround for the API 30/33 white-screen bug that occurs
+   * when a Google MapView is re-attached inside a bottom-tab navigator.
+   *
+   * <p>Implementation notes:
+   *   - {@code requestLayout()} forces a new measure/layout pass
+   *   - {@code invalidate()} schedules a redraw of the SurfaceView host
+   *   - re-applying the current map type causes Google's renderer to
+   *     re-acquire the GL context, which is what actually clears white tiles
+   *     on older API levels. On API 34+ this is a no-op cost.
+   */
+  public void forceRedraw() {
+    if (lifecycleDestroyed) {
+      return;
+    }
+    requestLayout();
+    invalidate();
+    mapView.requestLayout();
+    mapView.invalidate();
+
+    if (googleMap != null && Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE /* < 34 */) {
+      final int currentType = googleMap.getMapType();
+      // Bounce the map type to force a renderer refresh. The toggle happens
+      // in the same frame, so it is invisible to the user but forces the
+      // SurfaceTexture to be re-acquired.
+      googleMap.setMapType(currentType == GoogleMap.MAP_TYPE_NORMAL
+          ? GoogleMap.MAP_TYPE_NONE
+          : GoogleMap.MAP_TYPE_NORMAL);
+      mainHandler.post(() -> {
+        if (googleMap != null) {
+          googleMap.setMapType(currentType);
+        }
+      });
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // GoogleMap ready
+  // ------------------------------------------------------------------------
 
   @Override
   public void onMapReady(@NonNull GoogleMap map) {
@@ -104,15 +319,20 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
         lastRegionChangeWasGesture = reason == GoogleMap.OnCameraMoveStartedListener.REASON_GESTURE);
     map.setOnCameraMoveListener(() -> emitRegion("onRegionChange"));
     map.setOnCameraIdleListener(() -> emitRegion("onRegionChangeComplete"));
-    map.setOnMyLocationChangeListener(location -> emitUserLocation(location));
+    map.setOnMyLocationChangeListener(this::emitUserLocation);
     map.setMinZoomPreference(minZoom);
     map.setMaxZoomPreference(maxZoom);
+
     for (Runnable runnable : pending) {
       runnable.run();
     }
     pending.clear();
     emitEmpty("onMapReady");
   }
+
+  // ------------------------------------------------------------------------
+  // Pending-queue + gesture pass-through (unchanged behavior)
+  // ------------------------------------------------------------------------
 
   void whenReady(Runnable runnable) {
     if (googleMap == null) {
@@ -156,10 +376,10 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
     return true;
   }
 
-  void destroy() {
-    mapView.onPause();
-    mapView.onStop();
-    mapView.onDestroy();
+  @Override
+  protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+    super.onLayout(changed, left, top, right, bottom);
+    mapView.layout(0, 0, right - left, bottom - top);
   }
 
   @Override
@@ -167,6 +387,10 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
     requestDisallowInterceptTouchEvent(true);
     return super.dispatchTouchEvent(event);
   }
+
+  // ------------------------------------------------------------------------
+  // Event emission helpers (unchanged)
+  // ------------------------------------------------------------------------
 
   private void emitCoordinate(String eventName, LatLng latLng) {
     WritableMap event = Arguments.createMap();
@@ -227,8 +451,10 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
   }
 
   private void emit(String eventName, WritableMap event) {
-    ((ReactContext) getContext())
-        .getJSModule(RCTEventEmitter.class)
-        .receiveEvent(getId(), eventName, event);
+    ReactContext context = (ReactContext) getContext();
+    if (context == null) {
+      return;
+    }
+    context.getJSModule(RCTEventEmitter.class).receiveEvent(getId(), eventName, event);
   }
 }
