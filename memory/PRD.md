@@ -1,133 +1,43 @@
-# PRD — Android Map Fixes for rn-custom-map-sdk
+# rn-custom-map-sdk — Clustering perf & press behavior
 
-## Original problem statement
-> React Native custom map has 2 Android issues:
-> 1. `mapRef.current.animateToRegion()` doesn't work when called from edge
->    indicators (works fine from buttons).
-> 2. Map shows blank white screen on Android API 30 & 33 when using bottom
->    tabs (3 tabs with map on each). Works on iOS and API 34+.
->
-> Setup: custom native map SDK (rn-custom-map-sdk), bottom tabs with 3
-> separate MapView instances. Files: MapView.tsx (forwardRef),
-> RNCustomMapView.java, RNCustomMapModule.java.
+## Problem statement (verbatim)
+Fix cluster re-rendering and add cluster press behavior in the React Native
+map SDK. Stop constant re-renders during drag, add zoom-on-press behavior
+with override + max-zoom auto-expand.
 
-## User choices
-- React Native 0.83.4, **New Architecture (Fabric / TurboModules)** enabled
-- Navigation: `@react-navigation/bottom-tabs`
-- Underlying map: **Google Maps**
-- Delivery: complete drop-in files including the JS-side `MapView.tsx` patch
+## Architecture / changes — 2026-01
+- New pure-JS module `src/clustering/throttle.ts` with `regionToZoom`,
+  `pixelDistance`, `shouldRecompute`, `zoomBucketKey`.
+- `src/MapView.tsx` clustering pipeline rewritten:
+  - `liveRegionRef` tracks the camera during gestures; cluster compute is
+    NEVER triggered mid-drag.
+  - `onRegionChangeComplete` schedules a `debounceMs` timer; the timer
+    checks `renderThreshold` (Δzoom) and `dragThreshold` (Δpixels) before
+    bumping `regionForCompute`.
+  - `clusterCacheRef: Map<zoomBucket, Cluster[]>` reuses prior results when
+    the user revisits a zoom level. Cache resets on points / radius / viewport
+    change.
+  - Cluster taps default to "zoom in by `zoomStepOnPress` (=2)" via
+    `NativeMapViewManager.animateToRegion`. At `maxZoomLevel`, taps fall back
+    to `fitToCoordinates(cluster.markers)` to spread out the members.
+  - `customOnPress` fully overrides the default; legacy `onClusterPress` is
+    still fired for backwards compatibility.
+- `src/types.ts` `ClusterConfig` extended with the 5 new props.
 
-## What was implemented (Jan 2026)
+## Files touched
+- externalModules/rn-custom-map-sdk/src/clustering/throttle.ts (new)
+- externalModules/rn-custom-map-sdk/src/clustering/cluster.ts (unchanged)
+- externalModules/rn-custom-map-sdk/src/MapView.tsx
+- externalModules/rn-custom-map-sdk/src/types.ts
+- __tests__/clusteringThrottle.test.ts (new — 14 tests)
 
-### Issue 1 — `viewRegistry` for edge-indicator-driven refs
-- `RNCustomMapView.java` now owns a synchronized static `viewRegistry`
-  populated inside `setId(int)`. New static `findViewByTag(int)` for
-  module-side lookup.
-- `RNCustomMapModule.java` uses a two-tier resolver: registry first (lock-free,
-  immune to Fabric commit races), `UIManagerHelper.resolveView` as fallback.
-- `RNCustomMapViewManagerImpl.java` legacy WeakHashMap removed, helpers
-  delegate to the new registry.
-- `src/MapView.tsx` `getReactTag()` no longer throws when `findNodeHandle`
-  returns null on first frame — returns -1 sentinel and the native
-  resolver short-circuits + warns.
-
-### Issue 2 — Lifecycle for bottom-tab focus
-- `RNCustomMapView.java` constructor: only `onCreate(...)`. Subsequent
-  `onStart`/`onResume` driven from `onAttachedToWindow`.
-- `onDetachedFromWindow` cleanly calls `onPause`/`onStop` (does **not** destroy).
-- New public methods: `onHostResume()`, `onHostPause()`, `forceRedraw()`.
-- `forceRedraw()` on API < 34 bounces map type to force GL surface re-acquisition
-  (the actual fix for the white tiles).
-- Module: new `setActive(reactTag, boolean)` and `forceRedraw(reactTag)`
-  commands wired through the TurboModule spec.
-- New hook `useMapTabLifecycle(ref)`: soft-imports `useFocusEffect` from
-  `@react-navigation/native`. Activates+redraws on focus, deactivates on blur.
-- `MapViewMethods` extended with `setActive()`, `forceRedraw()`, `__getReactTag()`.
-
-### Demo wiring
-- `App.tsx` rewritten as a 3-tab `createBottomTabNavigator` example.
-- New `src/screens/TabbedMapScreen.tsx` with four edge indicators (▲ N, ▼ S, ◀ W, ▶ E)
-  that exercise the Issue-1 codepath, plus `useMapTabLifecycle(mapRef)` that
-  exercises the Issue-2 codepath.
-- `package.json`: added `@react-navigation/native`, `@react-navigation/bottom-tabs`,
-  `react-native-screens`, `react-native-safe-area-context`, `react-native-gesture-handler`.
-
-## Verification status
-- TypeScript: `npx tsc --noEmit` ✓ clean
-- ESLint: all changed JS/TS files ✓ clean
-- Java compilation: requires `./gradlew clean` (codegen regen for new spec
-  methods) then `yarn android` — **must be run on the user's machine** since
-  this preview environment has no Android SDK / emulator.
-
-## Architecture notes
-- View registry is per-process and survives view reparenting because we
-  re-key on every `setId` call.
-- `forceRedraw` is gated on `Build.VERSION.SDK_INT < UPSIDE_DOWN_CAKE` (API 34)
-  so it's a free no-op on devices that don't need it.
-- Hook is opt-in — existing single-screen apps that don't use bottom tabs
-  pay zero cost.
-
-## Backlog / future improvements
-- P2: iOS counterpart for `setActive`/`forceRedraw` (currently no-op; iOS
-  does not exhibit the bug, but symmetric API would simplify cross-platform
-  code).
-- P2: codegen-generated typed `setActive`/`forceRedraw` methods on the
-  Fabric view component itself (would let users skip the module roundtrip).
-- P3: integration test that mounts 3 maps in a tab navigator and asserts
-  no `null` resolution warnings in logcat.
-
----
-
-## Update — Marker Clustering (Jan 2026)
-
-### What was added
-- **`<Marker data={…} userData={…}>`** — arbitrary JS-only payload, never
-  bridged, surfaces verbatim at `cluster.markers[i].data`.
-- **`<MapView clusterConfig={…}>`** with `enabled`, `ignoreClusterIds`,
-  `radius`, `renderCluster`, `onClusterPress`, `forceJS`.
-- **Cluster** type: `{ id, coordinate, pointCount, markerIds, markers[] }`
-  where each `markers[i]` carries `{ id, coordinate, data, title }`.
-- **`src/clustering/cluster.ts`** — pure-JS O(n) pixel-space grid engine
-  with native-bucket fast-path.
-- **Android native acceleration** — `computeClusters` on `RNCustomMapModule`
-  uses `googleMap.getProjection().toScreenLocation(...)` for pixel-space
-  bucketing. Returns id groupings only; JS enriches with `data`.
-- **iOS native acceleration** — `computeClustersWithPoints:radius:` on
-  `RNCustomMapNativeView` uses `GMSProjection pointForCoordinate:` —
-  same algorithm/contract as Android.
-- **JS fallback** — automatic when native call fails / unavailable / forced.
-- **Demo** — `src/screens/ClusteringScreen.tsx` wired as a 4th bottom-tab,
-  showcasing image-stacked cluster bubbles drawn from `marker.data.avatar`.
-
-### Files added/modified
-- `externalModules/rn-custom-map-sdk/src/clustering/cluster.ts` (new)
-- `externalModules/rn-custom-map-sdk/src/MapView.tsx` (full clustering pipeline)
-- `externalModules/rn-custom-map-sdk/src/types.ts` (`Cluster`, `ClusterConfig`, marker `data`)
-- `externalModules/rn-custom-map-sdk/spec/NativeRNCustomMapViewManager.ts` (`computeClusters`)
-- `externalModules/rn-custom-map-sdk/android/.../RNCustomMapModule.java` (native impl)
-- `externalModules/rn-custom-map-sdk/ios/RNCustomMapView.h/.mm` (native impl)
-- `externalModules/rn-custom-map-sdk/ios/RNCustomMapModule.mm` (`RCT_EXPORT_METHOD`)
-- `externalModules/rn-custom-map-sdk/index.tsx` / `index.d.ts` (export `clusterPoints`)
-- `src/screens/ClusteringScreen.tsx` (new)
-- `App.tsx` (4th tab)
-- `CLUSTERING.md` (full write-up)
-
-### Verification
+## Verification
 - `npx tsc --noEmit` ✓ clean
-- ESLint on changed files ✓ clean
-- Java/Obj-C compilation requires `./gradlew clean && yarn android` (Android)
-  or `pod install && yarn ios` (iOS) on the user's machine.
+- `yarn test clusteringThrottle` ✓ 14/14 passing
+- ESLint ✓ clean on all touched files
 
-## Files
-- `externalModules/rn-custom-map-sdk/android/src/main/java/com/rncustommap/RNCustomMapView.java`
-- `externalModules/rn-custom-map-sdk/android/src/main/java/com/rncustommap/RNCustomMapModule.java`
-- `externalModules/rn-custom-map-sdk/android/src/main/java/com/rncustommap/RNCustomMapViewManagerImpl.java`
-- `externalModules/rn-custom-map-sdk/spec/NativeRNCustomMapViewManager.ts`
-- `externalModules/rn-custom-map-sdk/src/MapView.tsx`
-- `externalModules/rn-custom-map-sdk/src/hooks/useMapTabLifecycle.ts`
-- `externalModules/rn-custom-map-sdk/src/types.ts`
-- `externalModules/rn-custom-map-sdk/index.tsx`, `index.d.ts`
-- `src/screens/TabbedMapScreen.tsx`
-- `App.tsx`
-- `package.json`
-- `FIXES.md` (full write-up)
+## Backlog
+- P1: Document new clusterConfig props in CLUSTERING.md.
+- P2: Add an integration test exercising the debounce timer with fake timers.
+- P2: Surface `recompute()` as an imperative method for consumers who want to
+  force a refresh.

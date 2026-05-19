@@ -24,6 +24,11 @@ import Circle from './Circle';
 import Marker from './Marker';
 import Polyline from './Polyline';
 import { clusterPoints, type Cluster as EngineCluster, type ClusterPoint } from './clustering/cluster';
+import {
+  shouldRecompute,
+  zoomBucketKey,
+  regionToZoom,
+} from './clustering/throttle';
 import type {
   Camera,
   CircleProps,
@@ -47,6 +52,12 @@ const DEFAULT_DURATION = 500;
 const DEFAULT_FIT_PADDING = 50;
 const DEFAULT_CLUSTER_RADIUS = 60;
 const CLUSTER_MARKER_PREFIX = 'cluster:';
+const DEFAULT_RENDER_THRESHOLD = 0.5;
+const DEFAULT_DRAG_THRESHOLD = 50;
+const DEFAULT_DEBOUNCE_MS = 100;
+const DEFAULT_ZOOM_STEP_ON_PRESS = 2;
+const DEFAULT_MAX_ZOOM = 20;
+const DEFAULT_CLUSTER_EXPAND_PADDING = 80;
 
 type EventPayload<T> = NativeSyntheticEvent<T>;
 
@@ -385,9 +396,28 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     );
     const clusterRadius = clusterConfig?.radius ?? DEFAULT_CLUSTER_RADIUS;
     const forceJS = clusterConfig?.forceJS ?? false;
+    const renderThreshold = clusterConfig?.renderThreshold ?? DEFAULT_RENDER_THRESHOLD;
+    const dragThreshold = clusterConfig?.dragThreshold ?? DEFAULT_DRAG_THRESHOLD;
+    const debounceMs = clusterConfig?.debounceMs ?? DEFAULT_DEBOUNCE_MS;
+    const zoomStepOnPress = clusterConfig?.zoomStepOnPress ?? DEFAULT_ZOOM_STEP_ON_PRESS;
+    const customOnPress = clusterConfig?.customOnPress;
+    const maxZoomLevel = props.maxZoomLevel ?? DEFAULT_MAX_ZOOM;
 
-    /** Current visible region — tracked from onRegionChange events. */
-    const [currentRegion, setCurrentRegion] = useState<Region | undefined>(
+    /**
+     * Live region — updated on every region-change event (incl. mid-drag). Used
+     * only for tracking; never feeds the cluster engine directly.
+     */
+    const liveRegionRef = useRef<Region | undefined>(region ?? initialRegion);
+    /**
+     * Last region that was actually fed into the cluster engine. Used as the
+     * baseline for the renderThreshold / dragThreshold checks.
+     */
+    const lastComputedRegionRef = useRef<Region | undefined>(undefined);
+    /**
+     * Region that the recompute effect is currently computing against. Only
+     * advances when thresholds are met or inputs (points/viewport) change.
+     */
+    const [regionForCompute, setRegionForCompute] = useState<Region | undefined>(
       region ?? initialRegion,
     );
     /** Viewport pixel size — tracked from container onLayout. */
@@ -397,6 +427,13 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     });
     /** Latest computed clusters. */
     const [clusters, setClusters] = useState<Cluster[]>([]);
+    /**
+     * Zoom-bucket → cluster-array cache. Lets the user pan & zoom back through
+     * previously-computed levels without re-running the algorithm.
+     */
+    const clusterCacheRef = useRef<Map<string, Cluster[]>>(new Map());
+    /** Pending debounce handle for the "settle then recompute" timer. */
+    const recomputeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     /**
      * Splits the marker meta map into "passthrough" (kept as-is, e.g. items
@@ -422,8 +459,18 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     }, [clusteringEnabled, parsed.markerMeta, ignoreSet]);
 
     /**
+     * Reset the cluster cache whenever any input that materially affects the
+     * cluster output changes. Pan/zoom alone never invalidates the cache.
+     */
+    useEffect(() => {
+      clusterCacheRef.current.clear();
+    }, [clusterablePoints, ignoreSet, clusterRadius, viewport.width, viewport.height]);
+
+    /**
      * Run clustering: tries native first (Android/iOS only when supported)
-     * and gracefully falls back to the pure-JS engine.
+     * and gracefully falls back to the pure-JS engine. Results are written
+     * into the bucketed cache keyed by zoom level so that returning to a
+     * previously-computed zoom level is free.
      */
     const recompute = useCallback(async () => {
       if (!clusteringEnabled) return;
@@ -431,12 +478,20 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         setClusters([]);
         return;
       }
-      if (!currentRegion || viewport.width === 0 || viewport.height === 0) {
+      if (!regionForCompute || viewport.width === 0 || viewport.height === 0) {
+        return;
+      }
+
+      const cacheKey = zoomBucketKey(regionForCompute.longitudeDelta, renderThreshold);
+      const cached = clusterCacheRef.current.get(cacheKey);
+      if (cached) {
+        setClusters(cached);
+        lastComputedRegionRef.current = regionForCompute;
         return;
       }
 
       // --- Native acceleration path -------------------------------------
-      let nativeBuckets: EngineCluster[] | undefined;
+      let nativeResult: EngineCluster[] | undefined;
       if (!forceJS && (Platform.OS === 'android' || Platform.OS === 'ios')) {
         const tag = getReactTagSafe();
         const compute = (NativeMapViewManager as any).computeClusters;
@@ -449,9 +504,9 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
             }));
             const buckets = await compute(tag, minimal, clusterRadius);
             if (Array.isArray(buckets)) {
-              const jsResult = clusterPoints({
+              nativeResult = clusterPoints({
                 points: clusterablePoints,
-                region: currentRegion,
+                region: regionForCompute,
                 viewport,
                 radius: clusterRadius,
                 nativeBuckets: buckets.map((b: any) => ({
@@ -460,7 +515,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
                   coordinate: { latitude: b.latitude, longitude: b.longitude },
                 })),
               });
-              nativeBuckets = jsResult;
             }
           } catch {
             // Fall through to the JS engine below.
@@ -469,27 +523,144 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       }
 
       // --- JS fallback / primary path -----------------------------------
-      const result = nativeBuckets ?? clusterPoints({
+      const result = nativeResult ?? clusterPoints({
         points: clusterablePoints,
-        region: currentRegion,
+        region: regionForCompute,
         viewport,
         radius: clusterRadius,
       });
+      clusterCacheRef.current.set(cacheKey, result);
+      lastComputedRegionRef.current = regionForCompute;
       setClusters(result);
     }, [
       clusteringEnabled,
       clusterablePoints,
       passthroughIds.size,
-      currentRegion,
+      regionForCompute,
       viewport,
       clusterRadius,
       forceJS,
+      renderThreshold,
       getReactTagSafe,
     ]);
 
     useEffect(() => {
       recompute();
     }, [recompute]);
+
+    /**
+     * Schedule a debounced threshold check. Called when the camera *settles*
+     * (region-change-complete). The check itself runs after `debounceMs` so
+     * that rapid successive settles collapse into a single recompute.
+     */
+    const scheduleRecomputeCheck = useCallback(() => {
+      if (!clusteringEnabled) return;
+      if (recomputeTimerRef.current) clearTimeout(recomputeTimerRef.current);
+      recomputeTimerRef.current = setTimeout(() => {
+        recomputeTimerRef.current = null;
+        const live = liveRegionRef.current;
+        if (!live || viewport.width === 0 || viewport.height === 0) return;
+        const should = shouldRecompute({
+          previousRegion: lastComputedRegionRef.current,
+          currentRegion: live,
+          viewport,
+          renderThreshold,
+          dragThreshold,
+        });
+        if (should) setRegionForCompute(live);
+      }, Math.max(debounceMs, 0));
+    }, [clusteringEnabled, viewport, renderThreshold, dragThreshold, debounceMs]);
+
+    // Tear down any pending debounce on unmount.
+    useEffect(() => {
+      return () => {
+        if (recomputeTimerRef.current) {
+          clearTimeout(recomputeTimerRef.current);
+          recomputeTimerRef.current = null;
+        }
+      };
+    }, []);
+
+    // ------------------------------------------------------------------
+    // Cluster press dispatcher — default zoom-in behavior with overrides
+    // ------------------------------------------------------------------
+    const expandClusterToMarkers = useCallback((cluster: Cluster) => {
+      const tag = getReactTagSafe();
+      if (tag == null) return;
+      const coords = cluster.markers.map(m => m.coordinate);
+      if (coords.length === 0) return;
+      NativeMapViewManager.fitToCoordinates(tag, coords, {
+        animated: true,
+        padding: DEFAULT_CLUSTER_EXPAND_PADDING,
+        edgePadding: undefined,
+      });
+    }, [getReactTagSafe]);
+
+    const defaultZoomIntoCluster = useCallback((cluster: Cluster) => {
+      const tag = getReactTagSafe();
+      if (tag == null) return;
+      const live = liveRegionRef.current;
+      if (!live) return;
+
+      const currentZoom = regionToZoom(live.longitudeDelta);
+      const requestedZoom = currentZoom + zoomStepOnPress;
+
+      // Already at (or past) maxZoom AND the cluster still has > 1 member?
+      // Spread the camera over the members instead of zooming further.
+      if (cluster.pointCount > 1 && currentZoom >= maxZoomLevel - 1e-3) {
+        expandClusterToMarkers(cluster);
+        return;
+      }
+
+      const targetZoom = Math.min(requestedZoom, maxZoomLevel);
+      const newLngDelta = 360 / Math.pow(2, targetZoom);
+      const aspect =
+        live.longitudeDelta > 0 ? live.latitudeDelta / live.longitudeDelta : 1;
+
+      NativeMapViewManager.animateToRegion(
+        tag,
+        {
+          latitude: cluster.coordinate.latitude,
+          longitude: cluster.coordinate.longitude,
+          longitudeDelta: newLngDelta,
+          latitudeDelta: newLngDelta * aspect,
+        },
+        DEFAULT_DURATION,
+      );
+
+      // If zoom request was capped at maxZoom and we still have multiple
+      // markers in this cluster, fall back to spreading them out so the user
+      // can actually see them.
+      if (
+        cluster.pointCount > 1 &&
+        requestedZoom > maxZoomLevel &&
+        Math.abs(targetZoom - currentZoom) < 1e-3
+      ) {
+        expandClusterToMarkers(cluster);
+      }
+    }, [getReactTagSafe, zoomStepOnPress, maxZoomLevel, expandClusterToMarkers]);
+
+    const handleClusterPress = useCallback((cluster: Cluster) => {
+      // Fire legacy notification handler first (no-op if absent).
+      clusterConfig?.onClusterPress?.(cluster);
+
+      // customOnPress fully overrides default zoom behavior.
+      if (customOnPress) {
+        customOnPress(cluster);
+        return;
+      }
+
+      // Singleton clusters: nothing to expand — surface the original marker's
+      // onPress handler if one was registered.
+      if (cluster.pointCount === 1) {
+        const onlyId = cluster.markerIds[0];
+        const handler = parsed.markerPressHandlers.get(onlyId);
+        handler?.({ coordinate: cluster.coordinate });
+        return;
+      }
+
+      defaultZoomIntoCluster(cluster);
+    }, [clusterConfig, customOnPress, defaultZoomIntoCluster, parsed.markerPressHandlers]);
 
     // ------------------------------------------------------------------
     // Build the native marker list — clustered or passthrough
@@ -576,39 +747,42 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     }, []);
 
     // ------------------------------------------------------------------
-    // Marker press dispatch — routes cluster taps to onClusterPress
+    // Marker press dispatch — routes cluster taps to handleClusterPress
     // ------------------------------------------------------------------
     const handleMarkerPress = useCallback(
       (event: EventPayload<{ id: string; coordinate: Coordinate }>) => {
         const id = event.nativeEvent.id;
         if (clusteringEnabled && id.startsWith(CLUSTER_MARKER_PREFIX)) {
           const cluster = clusterById.get(id);
-          if (cluster) {
-            clusterConfig?.onClusterPress?.(cluster);
-          }
+          if (cluster) handleClusterPress(cluster);
           return;
         }
         parsed.markerPressHandlers.get(id)?.({ coordinate: event.nativeEvent.coordinate });
       },
-      [clusteringEnabled, clusterById, clusterConfig, parsed.markerPressHandlers],
+      [clusteringEnabled, clusterById, handleClusterPress, parsed.markerPressHandlers],
     );
 
     // ------------------------------------------------------------------
-    // Region tracking — needed to recluster on zoom
+    // Region tracking — needed to recluster on zoom, gated by debounce +
+    // renderThreshold + dragThreshold to keep the bubble layer stable.
     // ------------------------------------------------------------------
     const handleRegionChange = useCallback(
       (event: EventPayload<{ region: Region; details?: RegionChangeDetails }>) => {
-        if (clusteringEnabled) setCurrentRegion(event.nativeEvent.region);
+        // Track only. NEVER recompute mid-drag.
+        if (clusteringEnabled) liveRegionRef.current = event.nativeEvent.region;
         onRegionChange?.(event.nativeEvent.region, event.nativeEvent.details);
       },
       [clusteringEnabled, onRegionChange],
     );
     const handleRegionChangeComplete = useCallback(
       (event: EventPayload<{ region: Region; details?: RegionChangeDetails }>) => {
-        if (clusteringEnabled) setCurrentRegion(event.nativeEvent.region);
+        if (clusteringEnabled) {
+          liveRegionRef.current = event.nativeEvent.region;
+          scheduleRecomputeCheck();
+        }
         onRegionChangeComplete?.(event.nativeEvent.region, event.nativeEvent.details);
       },
-      [clusteringEnabled, onRegionChangeComplete],
+      [clusteringEnabled, onRegionChangeComplete, scheduleRecomputeCheck],
     );
 
     return (

@@ -134,6 +134,33 @@ export type ClusterConfig = {
    * Defaults to false.
    */
   forceJS?: boolean;
+  /**
+   * Minimum change in zoom level (Web-Mercator scale, log2(360 / lngDelta))
+   * required before clusters are recomputed. Keeps the bubble layer stable
+   * during small pinches. Default 0.5.
+   */
+  renderThreshold?: number;
+  /**
+   * Minimum on-screen pixel distance the map must be panned before clusters
+   * are recomputed. Prevents thrashing while the user is mid-drag. Default 50.
+   */
+  dragThreshold?: number;
+  /**
+   * Delay in milliseconds after the camera stops moving before the cluster
+   * recomputation runs. Default 100.
+   */
+  debounceMs?: number;
+  /**
+   * How many zoom levels the default cluster-press handler should advance.
+   * Ignored when `customOnPress` is supplied. Default 2.
+   */
+  zoomStepOnPress?: number;
+  /**
+   * Overrides the default cluster-press behavior. When supplied, it is the
+   * only handler invoked on tap — the SDK will NOT auto-zoom or expand the
+   * cluster. Use it when you want full control (e.g. open a bottom sheet).
+   */
+  customOnPress?: (cluster: Cluster) => void;
 };
 
 export interface MarkerProps {
