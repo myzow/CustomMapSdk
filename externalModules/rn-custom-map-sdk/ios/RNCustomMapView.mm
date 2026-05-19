@@ -1,6 +1,7 @@
 #import "RNCustomMapView.h"
 #import <GoogleMaps/GoogleMaps.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 #import <React/RCTConvert.h>
 #import <React/RCTConversions.h>
 #import <react/renderer/components/RNCustomMapSpec/ComponentDescriptors.h>
@@ -243,6 +244,19 @@ using namespace facebook::react;
       UIImage *image = [self cachedIconForItem:item key:iconKey];
       if (image) marker.icon = image;
       if (iconKey) self.markerIconKeys[identifier] = iconKey;
+    }
+
+    // Kick off (or coalesce) async HTTP fetches for remote icon sources.
+    // Cache-hits return synchronously inside fetchRemoteIconForMarkerId:
+    // — this is what makes the second single↔cluster transition instant.
+    if (isNew) {
+      NSString *src = [RCTConvert NSString:item[@"icon"]] ?: [RCTConvert NSString:item[@"image"]];
+      if (src.length > 0) {
+        NSURL *u = [NSURL URLWithString:src];
+        if (u && ([u.scheme isEqualToString:@"http"] || [u.scheme isEqualToString:@"https"])) {
+          [self fetchRemoteIconForMarkerId:identifier source:src];
+        }
+      }
     }
 
     if (isNew) {
@@ -591,11 +605,13 @@ using namespace facebook::react;
 
 /**
  * Build a snapshot cache key from the view's geometry + subview signature.
- * We deliberately don't hash pixel content — that's expensive and unneeded:
- * React mutates the subview tree whenever the visual changes, so the
- * subview-count + bounds + markerId tuple changes too.
+ * The key intentionally does NOT include the markerId: a cluster bubble's
+ * visual is determined entirely by its contents, so two different cluster
+ * ids that happen to render the same bubble (e.g. "3 stacked avatars + 7")
+ * share a single UIImage. That sharing is what kills the "image disappears
+ * when single↔cluster" repaint on zoom.
  */
-- (NSString *)snapshotKeyForView:(UIView *)view markerId:(NSString *)markerId
+- (NSString *)snapshotKeyForView:(UIView *)view markerId:(__unused NSString *)markerId
 {
   CGSize size = view.bounds.size;
   NSUInteger sig = view.subviews.count;
@@ -604,8 +620,8 @@ using namespace facebook::react;
     sig = sig * 31 + (NSUInteger)CGRectGetHeight(child.bounds);
     sig = sig * 31 + (NSUInteger)[child class];
   }
-  return [NSString stringWithFormat:@"view:%@:%.0fx%.0f:%lu",
-                                    markerId, size.width, size.height, (unsigned long)sig];
+  return [NSString stringWithFormat:@"view:%.0fx%.0f:%lu",
+                                    size.width, size.height, (unsigned long)sig];
 }
 
 - (void)mapView:(GMSMapView *)mapView didTapAtCoordinate:(CLLocationCoordinate2D)coordinate
@@ -799,6 +815,10 @@ using namespace facebook::react;
 {
   NSString *source = [RCTConvert NSString:item[@"icon"]] ?: [RCTConvert NSString:item[@"image"]];
   if (source.length > 0) {
+    // 1) Already cached from a previous fetch (any marker, any time) ?
+    UIImage *cached = [self.markerIconCache objectForKey:[@"src:" stringByAppendingString:source]];
+    if (cached) return cached;
+    // 2) Bundled image / file URL?
     UIImage *image = [UIImage imageNamed:source];
     if (!image) {
       NSURL *url = [NSURL URLWithString:source];
@@ -807,7 +827,17 @@ using namespace facebook::react;
       }
     }
     if (image) {
+      [self.markerIconCache setObject:image forKey:[@"src:" stringByAppendingString:source]];
       return image;
+    }
+    // 3) Remote URL: nothing synchronous to return — the caller will get a
+    //    transparent placeholder and we'll patch marker.icon in once the
+    //    fetch completes. The cache stays warm for every future marker that
+    //    references this URL, which is what makes single↔cluster transitions
+    //    instant on the second pass.
+    NSURL *remoteURL = [NSURL URLWithString:source];
+    if (remoteURL && ([remoteURL.scheme isEqualToString:@"http"] || [remoteURL.scheme isEqualToString:@"https"])) {
+      return [self transparentPlaceholderImage];
     }
   }
   // Cluster synthetic markers carry no icon/pinColor — their visual is
@@ -820,6 +850,106 @@ using namespace facebook::react;
     return [self transparentPlaceholderImage];
   }
   return [GMSMarker markerImageWithColor:[self colorFromString:[RCTConvert NSString:item[@"pinColor"]] fallback:UIColor.redColor]];
+}
+
+#pragma mark - Async HTTP icon loading
+
+/**
+ * Singleton URL session backed by an on-disk URLCache so a 1000-marker map
+ * doesn't refetch the same avatar URLs every cold start. The 16 MiB memory
+ * / 64 MiB disk caps are sized to comfortably hold ~few thousand small
+ * marker icons without bloating the app footprint.
+ */
++ (NSURLSession *)sharedIconSession
+{
+  static NSURLSession *session;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    NSURLCache *cache = [[NSURLCache alloc] initWithMemoryCapacity:16 * 1024 * 1024
+                                                       diskCapacity:64 * 1024 * 1024
+                                                           diskPath:@"RNCustomMapIconCache"];
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    config.URLCache = cache;
+    config.requestCachePolicy = NSURLRequestReturnCacheDataElseLoad;
+    config.HTTPMaximumConnectionsPerHost = 8;
+    session = [NSURLSession sessionWithConfiguration:config];
+  });
+  return session;
+}
+
+/**
+ * Tracks in-flight icon fetches by URL string. Multiple markers requesting
+ * the same image share a single network task — critical for 500-1000+
+ * marker maps where dozens of points often reuse the same avatar URL.
+ */
+- (NSMutableDictionary<NSString *, NSMutableArray *> *)pendingIconFetches
+{
+  static char key;
+  NSMutableDictionary *dict = objc_getAssociatedObject(self, &key);
+  if (!dict) {
+    dict = [NSMutableDictionary dictionary];
+    objc_setAssociatedObject(self, &key, dict, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  }
+  return dict;
+}
+
+- (void)fetchRemoteIconForMarkerId:(NSString *)markerId source:(NSString *)source
+{
+  if (source.length == 0 || markerId.length == 0) return;
+  NSString *cacheKey = [@"src:" stringByAppendingString:source];
+
+  // Cache hit? Apply synchronously and bail.
+  UIImage *cached = [self.markerIconCache objectForKey:cacheKey];
+  if (cached) {
+    GMSMarker *marker = self.markersById[markerId];
+    if (marker) {
+      marker.icon = cached;
+      self.markerIconKeys[markerId] = cacheKey;
+    }
+    return;
+  }
+
+  // Coalesce concurrent requests for the same URL.
+  NSMutableDictionary<NSString *, NSMutableArray *> *pending = [self pendingIconFetches];
+  NSMutableArray *waiters = pending[source];
+  if (waiters) {
+    [waiters addObject:markerId];
+    return;
+  }
+  waiters = [NSMutableArray arrayWithObject:markerId];
+  pending[source] = waiters;
+
+  NSURL *url = [NSURL URLWithString:source];
+  if (!url) {
+    [pending removeObjectForKey:source];
+    return;
+  }
+  __weak RNCustomMapNativeView *weakSelf = self;
+  NSURLSessionDataTask *task =
+    [[RNCustomMapNativeView sharedIconSession] dataTaskWithURL:url
+                                             completionHandler:^(NSData *data, __unused NSURLResponse *response, NSError *error) {
+      UIImage *image = (data && !error) ? [UIImage imageWithData:data] : nil;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        RNCustomMapNativeView *strong = weakSelf;
+        if (!strong) return;
+        NSArray *ids = [strong pendingIconFetches][source];
+        [[strong pendingIconFetches] removeObjectForKey:source];
+        if (!image) return;
+        [strong.markerIconCache setObject:image forKey:cacheKey];
+        // Apply to every marker that was waiting for this URL — markers
+        // that have been removed in the meantime are simply skipped.
+        for (NSString *waiterId in ids) {
+          GMSMarker *m = strong.markersById[waiterId];
+          if (m && [strong.markerIconKeys[waiterId] isEqualToString:cacheKey]) {
+            m.icon = image;
+          } else if (m && !strong.markerIconKeys[waiterId]) {
+            m.icon = image;
+            strong.markerIconKeys[waiterId] = cacheKey;
+          }
+        }
+      });
+    }];
+  [task resume];
 }
 
 /** Static, shared 1×1 transparent UIImage used as a stand-in while a

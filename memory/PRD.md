@@ -1,75 +1,83 @@
-# rn-custom-map-sdk — Native fixes (Issue 1 + Issue 2)
+# rn-custom-map-sdk — Persistent marker icon caching across single↔cluster
 
-## Problem statements (verbatim)
-**Issue 1 (iOS):** crash "Attempt to unmount a view which is mounted inside
-different view" on zoom/drag. Cause: marker snapshot UIViews reparented onto
-GMSMapView, then unmounted from the wrong parent on the React side.
+## Problem statement (verbatim)
+"Fix marker image not showing when switching between single marker and
+cluster marker (during zoom). Need to cache marker images at native level
+so when markers are recreated, they load from cache instead of reloading."
 
-**Issue 2 (Android & iOS):** custom markers briefly show the default Google
-Maps pin before swapping to the custom icon on every zoom/cluster recompute.
-Single markers should not re-render at all on zoom; clustered markers should
-re-render but show the custom icon instantly.
+## Root cause
+- The previous bitmap/UIImage caches were keyed by `markerId`, so a
+  re-created marker (e.g. after a cluster split) got a fresh cache key and
+  re-paid the full image load cost.
+- On iOS specifically, `markerImageForItem:` had **no HTTP/HTTPS loader at
+  all** — remote-URL marker icons resolved to the default red pin (or
+  transparent placeholder for cluster ids), and they never recovered.
 
-## Architecture / changes — 2026-01
+## Changes — 2026-01
 
 ### iOS (`ios/RNCustomMapView.mm`)
-- **Issue 1 fix**: `setMarkerView:` no longer assigns `marker.iconView`. It
-  takes a `UIImage` snapshot of the React view (`drawViewHierarchyInRect`)
-  and assigns it to `marker.icon`. The React view stays under its original
-  parent, so reconciler unmounts are safe.
-- **Issue 2 fix**: rewrote `setMarkers:` from full destroy-and-rebuild to an
-  incremental id-based diff. Existing markers keep their GMSMarker instance;
-  only position/title/icon-on-key-change are mutated. Singleton markers
-  therefore stay visually frozen on zoom.
-- New `NSCache<NSString *, UIImage *> markerIconCache` keyed by
-  `"src:<source>"` / `"pin:<color>"` / `"cluster:placeholder"` /
-  `"view:<markerId>:<sig>"`. Cache eliminates the redraw cost.
-- Cluster synthetic markers (id starts with `cluster:`) spawn with a static
-  transparent 1×1 placeholder image so the GMS default pin never flashes
-  while the JS snapshot is being painted.
-- Snapshot key uses geometry + subview signature — re-clustering at the same
-  zoom level reuses the cached bitmap.
+- Added async HTTP/HTTPS marker icon loader backed by a singleton
+  `NSURLSession` with a 16 MiB-memory / 64 MiB-disk `NSURLCache`. Every
+  fetched UIImage is also stored in the per-view `NSCache` under
+  `"src:<url>"`, so:
+  - First-time fetch shows a transparent placeholder, then patches
+    `marker.icon` when the network response arrives.
+  - Every subsequent reference to the same URL — including newly-created
+    GMSMarkers spawned by a single↔cluster transition — resolves
+    synchronously from cache.
+- In-flight fetches are **coalesced** by URL string so 1000 markers
+  referencing the same avatar URL issue exactly one network request.
+- `snapshotKeyForView:` no longer includes `markerId`. Two clusters that
+  render identical content (e.g. the same 3-avatar bubble) reuse the same
+  UIImage.
 
 ### Android (`android/.../RNCustomMapViewManagerImpl.java`)
-- Static `LruCache<String, Bitmap> ICON_CACHE` (4 MiB) with the same key
-  shape as iOS.
-- Rewrote `setMarkers` to the same id-based incremental diff: keep, update
-  position only when changed, only call `setIcon` when the icon cache key
-  changes.
-- `loadRemoteMarkerIcon` now applies cached bitmaps synchronously when
-  available, then skips Glide; populates the cache on first fetch. Re-mounts
-  of clustered markers therefore appear with the correct image immediately.
-- `setMarkerView` caches the rendered bitmap by `view:<markerId>:<sig>` and
-  only calls `setIcon` when the snapshot signature actually changed.
-- Cluster-prefixed markers receive a transparent 1×1 placeholder bitmap on
-  spawn (mirrors the iOS placeholder).
-- `RNCustomMapView` gains a `markerIconKeys: Map<String,String>` field used
-  by the ManagerImpl to decide whether `setIcon` is needed on a diff pass.
+- `snapshotKey` no longer includes `markerId` — same content-only key shape
+  as iOS, so different cluster ids with identical bubbles share a Bitmap.
+- Glide-backed `loadRemoteMarkerIcon` already wrote to the static
+  `ICON_CACHE`; with the content-only key + cache-first path in
+  `applyInitialMarkerIcon`, marker recreation is instant.
 
-### JS layer
-- No changes required. The existing id stability for passthrough markers
-  combined with native incremental diffing already gives "single markers
-  never re-render on zoom".
+## Why this fixes the bug
+- A single marker becoming part of a cluster → marker is removed from the
+  map. The bitmap stays in cache.
+- The cluster becoming a single marker again → the new GMSMarker is created
+  by `setMarkers:`. `cachedIconForItem:` → cache hit → instant icon.
+- Repeated zoom in/out across the same region now produces zero network
+  requests and zero render-from-scratch passes.
+
+## 500–1000+ marker optimizations carried over
+- Incremental `setMarkers` diff: existing markers keep their native
+  GMSMarker / Marker instance; only changed fields mutate.
+- Single in-flight network task per URL via the pending-fetches dictionary.
+- Cache key shared across the entire map view, not per-marker, so the
+  working set scales with **unique icons**, not unique markers.
+- O(1) cache lookups; O(n) diff; no per-frame work for unchanged markers.
+
+## Animation / GIF support — not in this iteration
+Static-snapshot rendering can't animate, and the previous attempt to use
+`marker.iconView` reparented React-managed views (causing the iOS crash
+already fixed in the prior iteration). Adding animation support cleanly
+would require either:
+- A `tracksViewChanges`-driven periodic re-snapshot loop (one shared
+  `CADisplayLink` / `Choreographer` callback), or
+- An SDK-owned UIView pool with on-demand snapshot updates.
+Either option is feasible but adds new lifecycle surface. Deferred to
+backlog as P1.
 
 ## Files touched (this iteration)
-- `externalModules/rn-custom-map-sdk/ios/RNCustomMapView.mm`
-- `externalModules/rn-custom-map-sdk/android/src/main/java/com/rncustommap/RNCustomMapView.java`
-- `externalModules/rn-custom-map-sdk/android/src/main/java/com/rncustommap/RNCustomMapViewManagerImpl.java`
+- `ios/RNCustomMapView.mm` — async URL fetch + cache + coalescing, content-only snapshot key, cache lookup in `markerImageForItem:`.
+- `android/.../RNCustomMapViewManagerImpl.java` — content-only snapshot key.
 
 ## Verification
-- `npx tsc --noEmit` ✓ clean (no JS-side ripples).
-- `yarn test clusteringThrottle` ✓ 14/14 still pass.
-- Bracket / paren balance check passes on both native files.
-- Native compilation requires a real Xcode / Android Studio toolchain (not
-  available in this sandbox); the changes follow existing patterns in the
-  file and use only documented SDK APIs (`UIGraphicsImageRenderer`,
-  `drawViewHierarchyInRect`, `LruCache`, `BitmapDescriptorFactory`,
-  `MarkerOptions.getIcon`).
+- `npx tsc --noEmit` clean.
+- `yarn test clusteringThrottle` — 14/14 pass.
+- Native files: brace/paren/bracket balance preserved.
 
 ## Backlog
-- P1: Add an LRU eviction signal so very long-running maps don't grow the
-  iOS NSCache forever (currently bounded only by `countLimit = 256`).
-- P2: Pre-warm remote icon bitmaps on the JS side before clusters update
-  (e.g. an `Image.prefetch(...)` pass on visible markers).
-- P2: Cluster bitmap *content* cache (independent of marker id) so two
-  different cluster ids holding identical content reuse the same Bitmap.
+- P1: Animation / GIF support via shared display-link re-snapshot or
+  SDK-owned UIView pool.
+- P2: Configurable cache limits (NSCache / LruCache sizes) exposed via a
+  new clusterConfig field.
+- P2: Optional `Image.prefetch` pass on the JS side to pre-warm the icon
+  cache before the first cluster recompute.

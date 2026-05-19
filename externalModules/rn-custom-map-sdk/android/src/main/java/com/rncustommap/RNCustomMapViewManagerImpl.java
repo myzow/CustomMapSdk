@@ -462,11 +462,12 @@ public final class RNCustomMapViewManagerImpl {
 
   /**
    * Cheap content-signature for a marker snapshot. Same shape as the iOS
-   * helper: marker id + size + (subview count, bounds, class) per child.
-   * React mutates subviews whenever the bubble's visual changes, so this is
-   * a faithful proxy for "the rendered output is different".
+   * helper: size + (subview count, bounds, class) per child. The key
+   * intentionally does NOT include the markerId so two different cluster
+   * ids that render the same bubble share a single cached Bitmap — that's
+   * what stops the "image disappears when single↔cluster" repaint on zoom.
    */
-  private static String snapshotKey(String markerId, View view) {
+  private static String snapshotKey(@SuppressWarnings("unused") String markerId, View view) {
     int sig = 0;
     if (view instanceof android.view.ViewGroup) {
       android.view.ViewGroup group = (android.view.ViewGroup) view;
@@ -478,7 +479,7 @@ public final class RNCustomMapViewManagerImpl {
         sig = sig * 31 + child.getClass().getName().hashCode();
       }
     }
-    return "view:" + markerId + ":" + view.getWidth() + "x" + view.getHeight() + ":" + sig;
+    return "view:" + view.getWidth() + "x" + view.getHeight() + ":" + sig;
   }
 
   static void setPolylines(RNCustomMapView view, @Nullable ReadableArray polylines) {
