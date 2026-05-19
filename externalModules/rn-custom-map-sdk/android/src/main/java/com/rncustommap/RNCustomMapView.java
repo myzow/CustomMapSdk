@@ -99,6 +99,14 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
   final Map<String, WritableMap> markerPayloads = new HashMap<>();
   final Map<String, Boolean> markerTappables = new HashMap<>();
   final Map<String, CustomTarget<android.graphics.Bitmap>> markerIconTargets = new HashMap<>();
+  /**
+   * Last icon cache key applied to each marker. The {@link RNCustomMapViewManagerImpl}
+   * uses this to decide whether {@code marker.setIcon(...)} actually needs to
+   * be called on a diff pass — which is what prevents the "default pin flash"
+   * reported in Issue 2. Keys are produced by
+   * {@code RNCustomMapViewManagerImpl#iconCacheKeyForItem}.
+   */
+  final Map<String, String> markerIconKeys = new HashMap<>();
 
   private final List<Runnable> pending = new ArrayList<>();
   @Nullable String selectedMarkerId;

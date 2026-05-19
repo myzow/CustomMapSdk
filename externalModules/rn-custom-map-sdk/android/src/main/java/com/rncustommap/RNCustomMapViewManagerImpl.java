@@ -8,6 +8,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.net.Uri;
+import android.util.LruCache;
 import android.view.View;
 import android.view.animation.AccelerateDecelerateInterpolator;
 import android.view.animation.AccelerateInterpolator;
@@ -30,6 +31,7 @@ import com.facebook.react.uimanager.UIManagerHelper;
 import com.facebook.react.uimanager.common.UIManagerType;
 import com.google.android.gms.maps.CameraUpdateFactory;
 import com.google.android.gms.maps.GoogleMap;
+import com.google.android.gms.maps.model.BitmapDescriptor;
 import com.google.android.gms.maps.model.BitmapDescriptorFactory;
 import com.google.android.gms.maps.model.CircleOptions;
 import com.google.android.gms.maps.model.Dash;
@@ -51,6 +53,59 @@ public final class RNCustomMapViewManagerImpl {
   // setId, see RNCustomMapView.java). These methods are kept as thin
   // back-compat shims so any callers outside the Module continue to work.
   private RNCustomMapViewManagerImpl() {}
+
+  // ---------------------------------------------------------------------
+  // Marker icon cache (Issue 2 fix).
+  //
+  // Keys:
+  //   "src:<url-or-path>"     remote / local marker image sources
+  //   "pin:<colorHex>"         pinColor default markers
+  //   "view:<markerId>:<sig>"  snapshots produced by setMarkerView
+  //
+  // 4 MiB is plenty for the typical use case (≤ a few hundred unique marker
+  // icons at standard pin sizes). Storing the resulting BitmapDescriptors
+  // alongside the bitmaps would be ideal but BitmapDescriptor is not
+  // bytesize-introspectable, so we re-wrap on lookup — that's a no-op cost
+  // because BitmapDescriptorFactory.fromBitmap doesn't decode anything when
+  // the Bitmap is already in memory.
+  // ---------------------------------------------------------------------
+  private static final LruCache<String, Bitmap> ICON_CACHE = new LruCache<String, Bitmap>(4 * 1024 * 1024) {
+    @Override
+    protected int sizeOf(String key, Bitmap value) {
+      return value.getByteCount();
+    }
+  };
+
+  @Nullable
+  static Bitmap getCachedIcon(String key) {
+    if (key == null) return null;
+    return ICON_CACHE.get(key);
+  }
+
+  static void putCachedIcon(String key, Bitmap bitmap) {
+    if (key != null && bitmap != null) {
+      ICON_CACHE.put(key, bitmap);
+    }
+  }
+
+  /**
+   * Stable cache key for a marker's icon spec — same shape as the iOS side.
+   * Markers with the same source share a Bitmap across the entire map, which
+   * is what kills the "default pin flash" reported in Issue 2.
+   */
+  private static String iconCacheKeyForItem(ReadableMap item) {
+    String source = getString(item, "icon");
+    if (source == null) source = getString(item, "image");
+    if (source != null && source.length() > 0) return "src:" + source;
+    String pin = getString(item, "pinColor");
+    if (pin != null && pin.length() > 0) return "pin:" + pin;
+    // Cluster synthetic markers carry no icon/pinColor; they get a transparent
+    // placeholder. Keep their cache slot separate from regular default-pin
+    // markers so the two never share a Bitmap by accident.
+    String id = getString(item, "id");
+    if (id != null && id.startsWith("cluster:")) return "cluster:placeholder";
+    return "pin:default";
+  }
 
   static void register(RNCustomMapView view) {
     // no-op: RNCustomMapView.setId() handles registration synchronously.
@@ -135,40 +190,143 @@ public final class RNCustomMapViewManagerImpl {
 
   static void setMarkers(RNCustomMapView view, @Nullable ReadableArray markers) {
     view.whenReady(() -> {
-      for (Marker marker : view.markers.values()) {
-        marker.remove();
-      }
-      view.markers.clear();
-      view.markerPayloads.clear();
-      view.markerTappables.clear();
-      view.markerIconTargets.clear();
+      // -----------------------------------------------------------------
+      // Incremental diff (Issue 2 fix).
+      //
+      // The old implementation removed every marker and rebuilt them from
+      // scratch on every prop update. With clustering on, that meant every
+      // cluster recompute flashed the default Google pin before the icon
+      // image finished re-applying. We now diff by id and:
+      //   - keep markers whose id is unchanged
+      //   - only update position / title when they actually change
+      //   - only re-apply the icon when the source key changed
+      //   - never re-add a marker that's already on the map
+      // Single (passthrough) markers therefore never re-render on zoom,
+      // and clustered markers re-render with their cached bitmap.
+      // -----------------------------------------------------------------
+      ReadableArray incoming = markers != null ? markers : Arguments.createArray();
 
-      if (markers == null) {
-        return;
-      }
-      for (int i = 0; i < markers.size(); i++) {
-        ReadableMap item = markers.getMap(i);
+      java.util.HashSet<String> incomingIds = new java.util.HashSet<>(incoming.size());
+      for (int i = 0; i < incoming.size(); i++) {
+        ReadableMap item = incoming.getMap(i);
         String id = item.hasKey("id") ? item.getString("id") : "marker-" + i;
-        MarkerOptions options = new MarkerOptions()
-            .position(new LatLng(item.getDouble("latitude"), item.getDouble("longitude")))
-            .title(getString(item, "title"))
-            .snippet(getString(item, "description"))
-            .draggable(getBoolean(item, "draggable", false))
-            .flat(getBoolean(item, "flat", false))
-            .rotation((float) getDouble(item, "rotation", 0d))
-            .alpha((float) getDouble(item, "opacity", 1d));
-        applyAnchor(options, item);
-        applyInitialMarkerIcon(options, item);
-        Marker marker = view.googleMap.addMarker(options);
-        if (marker != null) {
-          marker.setTag(id);
-          view.markers.put(id, marker);
-          view.markerPayloads.put(id, markerPayload(id, item));
-          view.markerTappables.put(id, getBoolean(item, "tappable", true));
-          loadRemoteMarkerIcon(view, marker, id, item);
+        incomingIds.add(id);
+      }
+
+      // 1) Drop markers that are gone.
+      java.util.ArrayList<String> existingIds = new java.util.ArrayList<>(view.markers.keySet());
+      for (String existingId : existingIds) {
+        if (!incomingIds.contains(existingId)) {
+          Marker gone = view.markers.remove(existingId);
+          if (gone != null) gone.remove();
+          view.markerPayloads.remove(existingId);
+          view.markerTappables.remove(existingId);
+          view.markerIconKeys.remove(existingId);
+          view.markerIconTargets.remove(existingId);
+          if (existingId.equals(view.selectedMarkerId)) {
+            view.selectedMarkerId = null;
+          }
         }
       }
+
+      // 2) Update / create.
+      for (int i = 0; i < incoming.size(); i++) {
+        ReadableMap item = incoming.getMap(i);
+        String id = item.hasKey("id") ? item.getString("id") : "marker-" + i;
+        LatLng position = new LatLng(item.getDouble("latitude"), item.getDouble("longitude"));
+        String iconKey = iconCacheKeyForItem(item);
+        Marker marker = view.markers.get(id);
+
+        if (marker == null) {
+          // Brand-new marker. Build with options + icon up front so it
+          // appears with the right visuals on its very first frame.
+          MarkerOptions options = new MarkerOptions()
+              .position(position)
+              .title(getString(item, "title"))
+              .snippet(getString(item, "description"))
+              .draggable(getBoolean(item, "draggable", false))
+              .flat(getBoolean(item, "flat", false))
+              .rotation((float) getDouble(item, "rotation", 0d))
+              .alpha((float) getDouble(item, "opacity", 1d));
+          applyAnchor(options, item);
+          applyInitialMarkerIcon(options, item, /*useCachedRemote=*/true);
+          marker = view.googleMap.addMarker(options);
+          if (marker == null) continue;
+          marker.setTag(id);
+          view.markers.put(id, marker);
+          view.markerIconKeys.put(id, iconKey);
+          // Async-load remote icons only when not already cached.
+          loadRemoteMarkerIcon(view, marker, id, item);
+        } else {
+          // Existing marker — surgical updates only.
+          if (marker.getPosition().latitude != position.latitude
+              || marker.getPosition().longitude != position.longitude) {
+            marker.setPosition(position);
+          }
+          String newTitle = getString(item, "title");
+          if (newTitle != null && !newTitle.equals(marker.getTitle())) marker.setTitle(newTitle);
+          String newSnippet = getString(item, "description");
+          if (newSnippet != null && !newSnippet.equals(marker.getSnippet())) marker.setSnippet(newSnippet);
+          marker.setDraggable(getBoolean(item, "draggable", false));
+          marker.setFlat(getBoolean(item, "flat", false));
+          marker.setRotation((float) getDouble(item, "rotation", 0d));
+          marker.setAlpha((float) getDouble(item, "opacity", 1d));
+
+          // Only re-apply the icon if the source key actually changed. This
+          // is the single most important line for Issue 2 — keeps the icon
+          // stable across re-clustering.
+          String previousKey = view.markerIconKeys.get(id);
+          if (previousKey == null || !previousKey.equals(iconKey)) {
+            applyIconFromCacheOrSource(marker, item, iconKey);
+            view.markerIconKeys.put(id, iconKey);
+            loadRemoteMarkerIcon(view, marker, id, item);
+          }
+        }
+
+        view.markerPayloads.put(id, markerPayload(id, item));
+        view.markerTappables.put(id, getBoolean(item, "tappable", true));
+      }
     });
+  }
+
+  /**
+   * Used by the incremental diff to re-apply a marker icon when its source
+   * key changed but the marker itself is being preserved. Hits the
+   * process-wide bitmap cache so a cluster bubble returning at the same zoom
+   * level shows instantly.
+   */
+  private static void applyIconFromCacheOrSource(Marker marker, ReadableMap item, String iconKey) {
+    Bitmap cached = getCachedIcon(iconKey);
+    if (cached != null && !cached.isRecycled()) {
+      marker.setIcon(BitmapDescriptorFactory.fromBitmap(cached));
+      return;
+    }
+    BitmapDescriptor descriptor = buildIconDescriptor(item);
+    if (descriptor != null) marker.setIcon(descriptor);
+  }
+
+  @Nullable
+  private static BitmapDescriptor buildIconDescriptor(ReadableMap item) {
+    String source = getString(item, "icon");
+    if (source == null) source = getString(item, "image");
+    if (source != null && source.length() > 0) {
+      try {
+        Uri uri = Uri.parse(source);
+        String scheme = uri.getScheme();
+        if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
+          // Remote — handled async by loadRemoteMarkerIcon. Fall through to pin.
+        } else if ("file".equals(scheme)) {
+          return BitmapDescriptorFactory.fromPath(uri.getPath());
+        } else {
+          return BitmapDescriptorFactory.fromPath(source);
+        }
+      } catch (RuntimeException ignored) { /* fall through */ }
+    }
+    String pinColor = getString(item, "pinColor");
+    if (pinColor != null) {
+      return BitmapDescriptorFactory.defaultMarker(hueForColor(parseColor(pinColor, Color.RED)));
+    }
+    return null;
   }
 
   // static void showMarkerCallout(RNCustomMapView view, String markerId) {
@@ -272,15 +430,54 @@ public final class RNCustomMapViewManagerImpl {
       if (marker == null || markerView.getWidth() <= 0 || markerView.getHeight() <= 0) {
         return;
       }
-      Bitmap bitmap = Bitmap.createBitmap(
-          markerView.getWidth(),
-          markerView.getHeight(),
-          Bitmap.Config.ARGB_8888);
-      Canvas canvas = new Canvas(bitmap);
-      markerView.draw(canvas);
-      marker.setIcon(BitmapDescriptorFactory.fromBitmap(bitmap));
-      marker.setAnchor(0.5f, 1f);
+      // ---------------------------------------------------------------
+      // Issue 2 fix on Android: cache rendered snapshots by markerId +
+      // size + subview signature so re-clustering at the same zoom level
+      // re-uses the same Bitmap. Without the cache, every cluster
+      // recompute repainted the bubble from the React view, briefly
+      // showing the default GMS pin underneath.
+      // ---------------------------------------------------------------
+      String key = snapshotKey(markerId, markerView);
+      Bitmap bitmap = getCachedIcon(key);
+      if (bitmap == null || bitmap.isRecycled()) {
+        bitmap = Bitmap.createBitmap(
+            markerView.getWidth(),
+            markerView.getHeight(),
+            Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        markerView.draw(canvas);
+        putCachedIcon(key, bitmap);
+      }
+      // Only call setIcon when the cache key actually changed — calling
+      // setIcon with an identical descriptor still triggers a relayout
+      // pass on the GMS marker and would re-introduce the brief flash.
+      String previousKey = mapView.markerIconKeys.get(markerId);
+      if (previousKey == null || !previousKey.equals(key)) {
+        marker.setIcon(BitmapDescriptorFactory.fromBitmap(bitmap));
+        marker.setAnchor(0.5f, 1f);
+        mapView.markerIconKeys.put(markerId, key);
+      }
     });
+  }
+
+  /**
+   * Cheap content-signature for a marker snapshot. Same shape as the iOS
+   * helper: marker id + size + (subview count, bounds, class) per child.
+   * React mutates subviews whenever the bubble's visual changes, so this is
+   * a faithful proxy for "the rendered output is different".
+   */
+  private static String snapshotKey(String markerId, View view) {
+    int sig = view.getChildCount();
+    if (view instanceof android.view.ViewGroup) {
+      android.view.ViewGroup group = (android.view.ViewGroup) view;
+      for (int i = 0; i < group.getChildCount(); i++) {
+        View child = group.getChildAt(i);
+        sig = sig * 31 + child.getWidth();
+        sig = sig * 31 + child.getHeight();
+        sig = sig * 31 + child.getClass().getName().hashCode();
+      }
+    }
+    return "view:" + markerId + ":" + view.getWidth() + "x" + view.getHeight() + ":" + sig;
   }
 
   static void setPolylines(RNCustomMapView view, @Nullable ReadableArray polylines) {
@@ -550,6 +747,16 @@ public final class RNCustomMapViewManagerImpl {
   }
 
   private static void applyInitialMarkerIcon(MarkerOptions options, ReadableMap item) {
+    applyInitialMarkerIcon(options, item, true);
+  }
+
+  /**
+   * @param useCachedRemote when true, a previously fetched remote icon is
+   *   applied synchronously from the bitmap cache so the marker spawns with
+   *   its custom icon already painted. Eliminates the "default pin flash"
+   *   when a clustered marker reappears at a familiar zoom level.
+   */
+  private static void applyInitialMarkerIcon(MarkerOptions options, ReadableMap item, boolean useCachedRemote) {
     String source = getString(item, "icon");
     if (source == null) {
       source = getString(item, "image");
@@ -559,7 +766,15 @@ public final class RNCustomMapViewManagerImpl {
         Uri uri = Uri.parse(source);
         String scheme = uri.getScheme();
         if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
-          applyPinColor(options, item);
+          if (useCachedRemote) {
+            Bitmap cached = getCachedIcon("src:" + source);
+            if (cached != null && !cached.isRecycled()) {
+              options.icon(BitmapDescriptorFactory.fromBitmap(cached));
+              return;
+            }
+          }
+          maybeApplyClusterPlaceholder(options, item);
+          if (options.getIcon() == null) applyPinColor(options, item);
           return;
         }
         if ("file".equals(uri.getScheme())) {
@@ -572,7 +787,31 @@ public final class RNCustomMapViewManagerImpl {
         // Fall back to pin color/default marker.
       }
     }
-    applyPinColor(options, item);
+    maybeApplyClusterPlaceholder(options, item);
+    if (options.getIcon() == null) applyPinColor(options, item);
+  }
+
+  /**
+   * Cluster synthetic markers have no icon/pinColor — their visual is
+   * supplied a frame later via setMarkerView. Spawn them with a transparent
+   * 1×1 placeholder so the GMS default pin never flashes through during
+   * that one-frame window (Issue 2). Mirrors the iOS placeholder behavior.
+   */
+  private static void maybeApplyClusterPlaceholder(MarkerOptions options, ReadableMap item) {
+    String id = getString(item, "id");
+    String pinColor = getString(item, "pinColor");
+    if (id != null && id.startsWith("cluster:") && (pinColor == null || pinColor.length() == 0)) {
+      options.icon(BitmapDescriptorFactory.fromBitmap(transparentPlaceholderBitmap()));
+    }
+  }
+
+  private static Bitmap sTransparentPlaceholder;
+  private static synchronized Bitmap transparentPlaceholderBitmap() {
+    if (sTransparentPlaceholder == null || sTransparentPlaceholder.isRecycled()) {
+      sTransparentPlaceholder = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+      // ARGB_8888 buffers start zeroed → fully transparent.
+    }
+    return sTransparentPlaceholder;
   }
 
   private static void applyPinColor(MarkerOptions options, ReadableMap item) {
@@ -595,11 +834,28 @@ public final class RNCustomMapViewManagerImpl {
     if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
       return;
     }
+    // Fast path: bitmap already cached from an earlier load anywhere on the
+    // map. Apply synchronously and skip the network fetch — this is what
+    // makes clustered markers re-appear with their custom icon instantly.
+    final String cacheKey = "src:" + source;
+    Bitmap cached = getCachedIcon(cacheKey);
+    if (cached != null && !cached.isRecycled()) {
+      marker.setIcon(BitmapDescriptorFactory.fromBitmap(cached));
+      marker.setAnchor(0.5f, 1f);
+      return;
+    }
+    final String finalSource = source;
     CustomTarget<Bitmap> target = new CustomTarget<Bitmap>() {
       @Override
       public void onResourceReady(Bitmap resource, @Nullable Transition<? super Bitmap> transition) {
-        marker.setIcon(BitmapDescriptorFactory.fromBitmap(resource));
-        marker.setAnchor(0.5f, 1f);
+        putCachedIcon(cacheKey, resource);
+        // Marker may have been removed during the async fetch — only update
+        // the marker if it's still tracked. The Bitmap is still cached for
+        // future re-appearances either way.
+        if (view.markers.get(markerId) == marker) {
+          marker.setIcon(BitmapDescriptorFactory.fromBitmap(resource));
+          marker.setAnchor(0.5f, 1f);
+        }
         view.markerIconTargets.remove(markerId);
       }
 
@@ -609,7 +865,7 @@ public final class RNCustomMapViewManagerImpl {
       }
     };
     view.markerIconTargets.put(markerId, target);
-    Glide.with(view).asBitmap().load(source).into(target);
+    Glide.with(view).asBitmap().load(finalSource).into(target);
   }
 
   private static Interpolator markerInterpolator(@Nullable ReadableMap options) {

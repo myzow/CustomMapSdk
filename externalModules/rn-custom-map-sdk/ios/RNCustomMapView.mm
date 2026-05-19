@@ -19,6 +19,30 @@ using namespace facebook::react;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *markerTappables;
 @property (nonatomic, copy) NSString *selectedMarkerId;
 @property (nonatomic, assign) BOOL lastRegionChangeWasGesture;
+/**
+ * Process-wide icon cache. Keys are either:
+ *   - "src:<sourceString>"      (built-in `image` / `icon` props)
+ *   - "pin:<colorHex>"           (pinColor default markers)
+ *   - "view:<markerId>:<hash>"   (snapshots of React-rendered marker views)
+ * Holding UIImages here is cheap (Core Animation backs them with shared
+ * bitmap storage) and prevents the "default pin flash" that happens when
+ * clusters re-render and have to re-resolve their icon from scratch.
+ */
+@property (nonatomic, strong) NSCache<NSString *, UIImage *> *markerIconCache;
+/**
+ * For each currently-mounted marker, remembers which cache key its icon was
+ * built from. We compare on every diff pass and only call `marker.icon = ...`
+ * when the key actually changed — that keeps the icon stable across
+ * re-clustering, which is what eliminates the "default pin flash" reported
+ * in Issue 2.
+ */
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *markerIconKeys;
+/**
+ * Marker source payload remembered across diff passes, used to decide
+ * whether title / coordinates / icon source actually changed. Avoids
+ * re-applying identical props (= no GMS-side relayout, no flicker).
+ */
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *markerLastItems;
 @end
 
 @implementation RNCustomMapNativeView
@@ -32,6 +56,10 @@ using namespace facebook::react;
     _mapCircles = [NSMutableArray new];
     _markerPayloads = [NSMutableDictionary new];
     _markerTappables = [NSMutableDictionary new];
+    _markerIconCache = [[NSCache alloc] init];
+    _markerIconCache.countLimit = 256;
+    _markerIconKeys = [NSMutableDictionary new];
+    _markerLastItems = [NSMutableDictionary new];
 
     GMSCameraPosition *camera = [GMSCameraPosition cameraWithLatitude:0 longitude:0 zoom:1];
     _mapView = [GMSMapView mapWithFrame:self.bounds camera:camera];
@@ -128,42 +156,142 @@ using namespace facebook::react;
 
 - (void)setMarkers:(NSArray *)markers
 {
-  for (GMSMarker *marker in self.mapMarkers) {
-    marker.map = nil;
+  // ----------------------------------------------------------------------
+  // Incremental diff (Issue 2 fix):
+  //   Old behaviour was nuke-and-rebuild on every prop update, which made
+  //   every cluster recompute briefly draw the default Google pin before
+  //   the icon image reattached. We now diff by id and:
+  //     - keep markers whose id is unchanged
+  //     - only mutate the smallest possible surface (position, icon-on-
+  //       source-change, title, etc.)
+  //     - never re-add a marker that is already on the map
+  // ----------------------------------------------------------------------
+  NSArray *incoming = markers ?: @[];
+  NSMutableSet<NSString *> *incomingIds = [NSMutableSet setWithCapacity:incoming.count];
+  for (NSDictionary *item in incoming) {
+    NSString *identifier = [RCTConvert NSString:item[@"id"]];
+    if (identifier.length > 0) {
+      [incomingIds addObject:identifier];
+    }
   }
-  [self.mapMarkers removeAllObjects];
-  [self.markersById removeAllObjects];
-  [self.markerPayloads removeAllObjects];
-  [self.markerTappables removeAllObjects];
-  self.selectedMarkerId = nil;
 
-  for (NSDictionary *item in markers ?: @[]) {
+  // 1) Remove markers that are no longer in the prop. CRITICAL: do NOT
+  //    touch marker.iconView here — we never use iconView anymore (Issue 1).
+  NSArray<NSString *> *existingIds = [self.markersById.allKeys copy];
+  for (NSString *existingId in existingIds) {
+    if (![incomingIds containsObject:existingId]) {
+      GMSMarker *gone = self.markersById[existingId];
+      gone.map = nil;
+      [self.markersById removeObjectForKey:existingId];
+      [self.markerPayloads removeObjectForKey:existingId];
+      [self.markerTappables removeObjectForKey:existingId];
+      [self.markerIconKeys removeObjectForKey:existingId];
+      [self.markerLastItems removeObjectForKey:existingId];
+      if (gone) [self.mapMarkers removeObject:gone];
+      if ([self.selectedMarkerId isEqualToString:existingId]) {
+        self.selectedMarkerId = nil;
+      }
+    }
+  }
+
+  // 2) Update / create.
+  for (NSDictionary *item in incoming) {
     NSString *identifier = [RCTConvert NSString:item[@"id"]] ?: @"";
-    CLLocationCoordinate2D coordinate = CLLocationCoordinate2DMake([item[@"latitude"] doubleValue], [item[@"longitude"] doubleValue]);
-    GMSMarker *marker = [GMSMarker markerWithPosition:coordinate];
-    marker.title = [RCTConvert NSString:item[@"title"]];
-    marker.snippet = [RCTConvert NSString:item[@"description"]];
+    if (identifier.length == 0) continue;
+    CLLocationCoordinate2D coordinate = CLLocationCoordinate2DMake(
+        [item[@"latitude"] doubleValue], [item[@"longitude"] doubleValue]);
+    GMSMarker *marker = self.markersById[identifier];
+    BOOL isNew = (marker == nil);
+    if (isNew) {
+      marker = [GMSMarker markerWithPosition:coordinate];
+      marker.userData = identifier;
+    } else {
+      // Only move the marker if the coordinate actually changed — saves a
+      // re-layout pass and keeps a singleton marker visually frozen during
+      // pan/zoom (Issue 2: "Single markers should NOT re-render at all").
+      if (marker.position.latitude != coordinate.latitude ||
+          marker.position.longitude != coordinate.longitude) {
+        marker.position = coordinate;
+      }
+    }
+
+    NSString *newTitle = [RCTConvert NSString:item[@"title"]];
+    if (![marker.title isEqualToString:newTitle ?: @""]) marker.title = newTitle;
+    NSString *newSnippet = [RCTConvert NSString:item[@"description"]];
+    if (![marker.snippet isEqualToString:newSnippet ?: @""]) marker.snippet = newSnippet;
     marker.draggable = [RCTConvert BOOL:item[@"draggable"]];
     marker.flat = [RCTConvert BOOL:item[@"flat"]];
     marker.rotation = item[@"rotation"] ? [item[@"rotation"] doubleValue] : 0;
     marker.opacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : 1;
     marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:CGPointMake(0.5, 1)];
-    marker.infoWindowAnchor = [self pointFromDictionary:item[@"calloutAnchor"] fallback:[self pointFromDictionary:item[@"calloutOffset"] fallback:CGPointMake(0.5, 0)]];
-    marker.userData = identifier;
-    marker.icon = [self markerImageForItem:item];
-    marker.tracksViewChanges = item[@"tracksViewChanges"] ? [RCTConvert BOOL:item[@"tracksViewChanges"]] : YES;
-    marker.map = self.mapView;
+    marker.infoWindowAnchor = [self pointFromDictionary:item[@"calloutAnchor"]
+                                                fallback:[self pointFromDictionary:item[@"calloutOffset"]
+                                                                          fallback:CGPointMake(0.5, 0)]];
+    BOOL incomingTracks = item[@"tracksViewChanges"]
+        ? [RCTConvert BOOL:item[@"tracksViewChanges"]] : NO;
+    if (marker.tracksViewChanges != incomingTracks) {
+      marker.tracksViewChanges = incomingTracks;
+    }
 
+    // Icon: only re-apply when the source key actually changed. This is the
+    // hot path that used to cause the "default pin flash" — we now hit the
+    // NSCache, so re-clustering reuses the same UIImage instance and the
+    // marker never visually drops back to the GMS default.
+    NSString *iconKey = [self iconCacheKeyForItem:item];
+    NSString *previousKey = self.markerIconKeys[identifier];
+    if (isNew || ![previousKey isEqualToString:iconKey]) {
+      UIImage *image = [self cachedIconForItem:item key:iconKey];
+      if (image) marker.icon = image;
+      if (iconKey) self.markerIconKeys[identifier] = iconKey;
+    }
+
+    if (isNew) {
+      marker.map = self.mapView;
+      [self.mapMarkers addObject:marker];
+      self.markersById[identifier] = marker;
+    }
     self.markerPayloads[identifier] = @{
       @"id": identifier,
       @"coordinate": @{@"latitude": @(coordinate.latitude), @"longitude": @(coordinate.longitude)},
       @"title": marker.title ?: @"",
       @"description": marker.snippet ?: @""
     };
-    self.markersById[identifier] = marker;
     self.markerTappables[identifier] = @([self boolFromDictionary:item key:@"tappable" fallback:YES]);
-    [self.mapMarkers addObject:marker];
+    self.markerLastItems[identifier] = item;
   }
+}
+
+#pragma mark - Marker icon cache
+
+/**
+ * Stable cache key for a marker's icon spec. Markers with the same icon
+ * source share the same UIImage instance across the entire map, which is
+ * what makes Issue 2 disappear: a cluster bubble re-spawned at the same zoom
+ * level pulls its icon from cache instantly instead of falling back to the
+ * default pin while a view snapshot is built.
+ */
+- (NSString *)iconCacheKeyForItem:(NSDictionary *)item
+{
+  NSString *source = [RCTConvert NSString:item[@"icon"]] ?: [RCTConvert NSString:item[@"image"]];
+  if (source.length > 0) return [@"src:" stringByAppendingString:source];
+  NSString *pin = [RCTConvert NSString:item[@"pinColor"]];
+  if (pin.length > 0) return [@"pin:" stringByAppendingString:pin];
+  // Cluster synthetic markers carry no icon/pinColor; they get a transparent
+  // placeholder. Keep their cache slot separate from regular default-pin
+  // markers so the two never share a UIImage by accident.
+  NSString *identifier = [RCTConvert NSString:item[@"id"]];
+  if ([identifier hasPrefix:@"cluster:"]) return @"cluster:placeholder";
+  return @"pin:default";
+}
+
+- (UIImage *)cachedIconForItem:(NSDictionary *)item key:(NSString *)key
+{
+  if (key.length == 0) return nil;
+  UIImage *cached = [self.markerIconCache objectForKey:key];
+  if (cached) return cached;
+  UIImage *image = [self markerImageForItem:item];
+  if (image) [self.markerIconCache setObject:image forKey:key];
+  return image;
 }
 
 - (void)setPolylines:(NSArray *)polylines
@@ -403,11 +531,81 @@ using namespace facebook::react;
 - (void)setMarkerView:(UIView *)markerView markerId:(NSString *)markerId
 {
   GMSMarker *marker = self.markersById[markerId];
-  if (!marker || !markerView) {
+  if (!marker || !markerView || markerId.length == 0) {
     return;
   }
-  marker.iconView = markerView;
-  marker.tracksViewChanges = YES;
+  CGSize size = markerView.bounds.size;
+  if (size.width <= 0 || size.height <= 0) {
+    // The React view may not have been measured yet; bail and rely on the
+    // follow-up onLayout-triggered call from the JS side.
+    return;
+  }
+
+  // ----------------------------------------------------------------------
+  // Issue 1 fix: do NOT reparent the React-owned UIView onto the marker.
+  //
+  // Assigning marker.iconView = markerView causes GMSMapView to physically
+  // move the view into its own internal hierarchy. The React reconciler
+  // later tries to unmount that same view from its *original* parent and
+  // crashes with "Attempt to unmount a view which is mounted inside
+  // different view".
+  //
+  // Instead, take a UIImage snapshot of the React view and assign it as
+  // marker.icon — the view stays exactly where React put it, and the marker
+  // renders the snapshot. Snapshots are cached under
+  // "view:<markerId>:<size+contentHash>" so repeated re-cluster passes
+  // hit the cache and show the icon immediately (Issue 2: "no flash").
+  // ----------------------------------------------------------------------
+  NSString *contentKey = [self snapshotKeyForView:markerView markerId:markerId];
+  UIImage *image = [self.markerIconCache objectForKey:contentKey];
+  if (!image) {
+    image = [self renderViewToImage:markerView];
+    if (image) [self.markerIconCache setObject:image forKey:contentKey];
+  }
+  if (!image) {
+    return;
+  }
+  marker.icon = image;
+  marker.groundAnchor = CGPointMake(0.5, 0.5);
+  marker.tracksViewChanges = NO;
+  self.markerIconKeys[markerId] = contentKey;
+}
+
+/**
+ * Render a UIView's current visual state into a UIImage at the device's
+ * native scale. Uses drawViewHierarchyInRect because some children may host
+ * UIKit controls / async-loaded images that don't render via -[CALayer
+ * renderInContext:].
+ */
+- (UIImage *)renderViewToImage:(UIView *)view
+{
+  CGSize size = view.bounds.size;
+  if (size.width <= 0 || size.height <= 0) return nil;
+  UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+  format.opaque = NO;
+  UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+  return [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *ctx) {
+    [view drawViewHierarchyInRect:view.bounds afterScreenUpdates:NO];
+  }];
+}
+
+/**
+ * Build a snapshot cache key from the view's geometry + subview signature.
+ * We deliberately don't hash pixel content — that's expensive and unneeded:
+ * React mutates the subview tree whenever the visual changes, so the
+ * subview-count + bounds + markerId tuple changes too.
+ */
+- (NSString *)snapshotKeyForView:(UIView *)view markerId:(NSString *)markerId
+{
+  CGSize size = view.bounds.size;
+  NSUInteger sig = view.subviews.count;
+  for (UIView *child in view.subviews) {
+    sig = sig * 31 + (NSUInteger)CGRectGetWidth(child.bounds);
+    sig = sig * 31 + (NSUInteger)CGRectGetHeight(child.bounds);
+    sig = sig * 31 + (NSUInteger)[child class];
+  }
+  return [NSString stringWithFormat:@"view:%@:%.0fx%.0f:%lu",
+                                    markerId, size.width, size.height, (unsigned long)sig];
 }
 
 - (void)mapView:(GMSMapView *)mapView didTapAtCoordinate:(CLLocationCoordinate2D)coordinate
@@ -612,7 +810,32 @@ using namespace facebook::react;
       return image;
     }
   }
+  // Cluster synthetic markers carry no icon/pinColor — their visual is
+  // supplied a frame later via setMarkerView:. Spawn them with a
+  // transparent 1×1 placeholder so the GMS default pin never flashes
+  // through during that one-frame window (Issue 2).
+  NSString *identifier = [RCTConvert NSString:item[@"id"]];
+  NSString *pinColor = [RCTConvert NSString:item[@"pinColor"]];
+  if ([identifier hasPrefix:@"cluster:"] && pinColor.length == 0) {
+    return [self transparentPlaceholderImage];
+  }
   return [GMSMarker markerImageWithColor:[self colorFromString:[RCTConvert NSString:item[@"pinColor"]] fallback:UIColor.redColor]];
+}
+
+/** Static, shared 1×1 transparent UIImage used as a stand-in while a
+ *  cluster marker waits for its React snapshot to arrive. */
+- (UIImage *)transparentPlaceholderImage
+{
+  static UIImage *placeholder;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer =
+        [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(1, 1) format:format];
+    placeholder = [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *ctx) {}];
+  });
+  return placeholder;
 }
 
 - (float)zoomFromLongitudeDelta:(double)longitudeDelta
