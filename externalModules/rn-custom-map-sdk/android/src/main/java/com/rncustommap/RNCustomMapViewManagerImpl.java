@@ -467,9 +467,10 @@ public final class RNCustomMapViewManagerImpl {
    * a faithful proxy for "the rendered output is different".
    */
   private static String snapshotKey(String markerId, View view) {
-    int sig = view.getChildCount();
+    int sig = 0;
     if (view instanceof android.view.ViewGroup) {
       android.view.ViewGroup group = (android.view.ViewGroup) view;
+      sig = group.getChildCount();
       for (int i = 0; i < group.getChildCount(); i++) {
         View child = group.getChildAt(i);
         sig = sig * 31 + child.getWidth();
