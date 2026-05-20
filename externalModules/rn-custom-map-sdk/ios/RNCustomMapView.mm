@@ -17,6 +17,11 @@ using namespace facebook::react;
 @property (nonatomic, strong) NSMutableArray<GMSCircle *> *mapCircles;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *markerPayloads;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *markerTappables;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *markerIconSources;
+@property (nonatomic, strong) NSCache<NSString *, UIImage *> *iconCache;
+@property (nonatomic, strong) NSCache<NSString *, UIImage *> *placeholderCache;
+@property (nonatomic, strong) NSCache<NSString *, UIImage *> *viewBitmapCache;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray *> *iconWaiters;
 @property (nonatomic, copy) NSString *selectedMarkerId;
 @property (nonatomic, assign) BOOL lastRegionChangeWasGesture;
 @end
@@ -32,6 +37,27 @@ using namespace facebook::react;
     _mapCircles = [NSMutableArray new];
     _markerPayloads = [NSMutableDictionary new];
     _markerTappables = [NSMutableDictionary new];
+    _markerIconSources = [NSMutableDictionary new];
+    _iconWaiters = [NSMutableDictionary new];
+
+    // Process-wide caches. NSCache evicts under memory pressure on its
+    // own; we also wipe it manually via UIApplicationDidReceiveMemoryWarning
+    // (some devices don't deliver an NSCache eviction until much later).
+    _iconCache = [NSCache new];
+    _iconCache.name = @"RNCustomMap.iconCache";
+    _iconCache.countLimit = 256;
+    _placeholderCache = [NSCache new];
+    _placeholderCache.name = @"RNCustomMap.placeholderCache";
+    _placeholderCache.countLimit = 64;
+    _viewBitmapCache = [NSCache new];
+    _viewBitmapCache.name = @"RNCustomMap.viewBitmapCache";
+    _viewBitmapCache.countLimit = 256;
+
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+           selector:@selector(handleMemoryWarning)
+               name:UIApplicationDidReceiveMemoryWarningNotification
+             object:nil];
 
     GMSCameraPosition *camera = [GMSCameraPosition cameraWithLatitude:0 longitude:0 zoom:1];
     _mapView = [GMSMapView mapWithFrame:self.bounds camera:camera];
@@ -46,6 +72,18 @@ using namespace facebook::react;
     });
   }
   return self;
+}
+
+- (void)dealloc
+{
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)handleMemoryWarning
+{
+  [self.iconCache removeAllObjects];
+  [self.placeholderCache removeAllObjects];
+  [self.viewBitmapCache removeAllObjects];
 }
 
 - (void)layoutSubviews
@@ -128,42 +166,108 @@ using namespace facebook::react;
 
 - (void)setMarkers:(NSArray *)markers
 {
-  for (GMSMarker *marker in self.mapMarkers) {
-    marker.map = nil;
-  }
-  [self.mapMarkers removeAllObjects];
-  [self.markersById removeAllObjects];
-  [self.markerPayloads removeAllObjects];
-  [self.markerTappables removeAllObjects];
-  self.selectedMarkerId = nil;
-
+  // ----------------------------------------------------------------
+  // Diff-based update — mirrors the Android implementation. The
+  // previous logic destroyed and recreated every GMSMarker on every
+  // setMarkers call, which is what made the default red pin briefly
+  // appear during cluster transitions. We now reuse existing markers
+  // and only touch the fields that changed.
+  // ----------------------------------------------------------------
+  NSMutableDictionary<NSString *, NSDictionary *> *incoming = [NSMutableDictionary new];
+  NSMutableArray<NSString *> *incomingOrder = [NSMutableArray new];
   for (NSDictionary *item in markers ?: @[]) {
     NSString *identifier = [RCTConvert NSString:item[@"id"]] ?: @"";
-    CLLocationCoordinate2D coordinate = CLLocationCoordinate2DMake([item[@"latitude"] doubleValue], [item[@"longitude"] doubleValue]);
-    GMSMarker *marker = [GMSMarker markerWithPosition:coordinate];
-    marker.title = [RCTConvert NSString:item[@"title"]];
-    marker.snippet = [RCTConvert NSString:item[@"description"]];
-    marker.draggable = [RCTConvert BOOL:item[@"draggable"]];
-    marker.flat = [RCTConvert BOOL:item[@"flat"]];
-    marker.rotation = item[@"rotation"] ? [item[@"rotation"] doubleValue] : 0;
-    marker.opacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : 1;
-    marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:CGPointMake(0.5, 1)];
-    marker.infoWindowAnchor = [self pointFromDictionary:item[@"calloutAnchor"] fallback:[self pointFromDictionary:item[@"calloutOffset"] fallback:CGPointMake(0.5, 0)]];
-    marker.userData = identifier;
-    marker.icon = [self markerImageForItem:item];
-    marker.tracksViewChanges = item[@"tracksViewChanges"] ? [RCTConvert BOOL:item[@"tracksViewChanges"]] : YES;
-    marker.map = self.mapView;
+    if (identifier.length == 0) continue;
+    incoming[identifier] = item;
+    [incomingOrder addObject:identifier];
+  }
 
+  // 1) Remove markers that are no longer present.
+  NSMutableArray<NSString *> *toRemove = [NSMutableArray new];
+  for (NSString *existingId in self.markersById.allKeys) {
+    if (!incoming[existingId]) {
+      [toRemove addObject:existingId];
+    }
+  }
+  for (NSString *removedId in toRemove) {
+    GMSMarker *m = self.markersById[removedId];
+    if (m) {
+      m.map = nil;
+      [self.mapMarkers removeObject:m];
+    }
+    [self.markersById removeObjectForKey:removedId];
+    [self.markerPayloads removeObjectForKey:removedId];
+    [self.markerTappables removeObjectForKey:removedId];
+    [self.markerIconSources removeObjectForKey:removedId];
+    if ([self.selectedMarkerId isEqualToString:removedId]) self.selectedMarkerId = nil;
+  }
+
+  // 2) Reuse / create.
+  for (NSString *identifier in incomingOrder) {
+    NSDictionary *item = incoming[identifier];
+    CLLocationCoordinate2D coordinate = CLLocationCoordinate2DMake(
+        [item[@"latitude"] doubleValue], [item[@"longitude"] doubleValue]);
+    GMSMarker *marker = self.markersById[identifier];
+    NSString *newSource = [RCTConvert NSString:item[@"icon"]] ?: [RCTConvert NSString:item[@"image"]];
+    NSString *prevSource = self.markerIconSources[identifier];
+
+    if (marker) {
+      // Position update — GMS bridges to setPosition which animates by default.
+      if (!(marker.position.latitude == coordinate.latitude &&
+            marker.position.longitude == coordinate.longitude)) {
+        marker.position = coordinate;
+      }
+      marker.title = [RCTConvert NSString:item[@"title"]];
+      marker.snippet = [RCTConvert NSString:item[@"description"]];
+      marker.draggable = [RCTConvert BOOL:item[@"draggable"]];
+      marker.flat = [RCTConvert BOOL:item[@"flat"]];
+      marker.rotation = item[@"rotation"] ? [item[@"rotation"] doubleValue] : marker.rotation;
+      marker.opacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : marker.opacity;
+      marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:marker.groundAnchor];
+      // Only re-resolve the icon when the source changed.
+      if (![self stringsEqual:newSource other:prevSource]) {
+        marker.icon = [self markerImageForItem:item];
+      }
+    } else {
+      marker = [GMSMarker markerWithPosition:coordinate];
+      marker.title = [RCTConvert NSString:item[@"title"]];
+      marker.snippet = [RCTConvert NSString:item[@"description"]];
+      marker.draggable = [RCTConvert BOOL:item[@"draggable"]];
+      marker.flat = [RCTConvert BOOL:item[@"flat"]];
+      marker.rotation = item[@"rotation"] ? [item[@"rotation"] doubleValue] : 0;
+      marker.opacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : 1;
+      marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:CGPointMake(0.5, 1)];
+      marker.infoWindowAnchor = [self pointFromDictionary:item[@"calloutAnchor"]
+                                                fallback:[self pointFromDictionary:item[@"calloutOffset"]
+                                                                          fallback:CGPointMake(0.5, 0)]];
+      marker.userData = identifier;
+      marker.icon = [self markerImageForItem:item];
+      marker.tracksViewChanges = item[@"tracksViewChanges"] ? [RCTConvert BOOL:item[@"tracksViewChanges"]] : YES;
+      marker.map = self.mapView;
+      self.markersById[identifier] = marker;
+      [self.mapMarkers addObject:marker];
+    }
+
+    self.markerIconSources[identifier] = newSource ?: @"";
     self.markerPayloads[identifier] = @{
       @"id": identifier,
       @"coordinate": @{@"latitude": @(coordinate.latitude), @"longitude": @(coordinate.longitude)},
       @"title": marker.title ?: @"",
       @"description": marker.snippet ?: @""
     };
-    self.markersById[identifier] = marker;
     self.markerTappables[identifier] = @([self boolFromDictionary:item key:@"tappable" fallback:YES]);
-    [self.mapMarkers addObject:marker];
+
+    // Kick off the remote load if needed; the icon already shows the
+    // placeholder bitmap so the user never sees the default red pin.
+    [self ensureMarkerIcon:marker identifier:identifier source:newSource item:item];
   }
+}
+
+- (BOOL)stringsEqual:(NSString *)a other:(NSString *)b
+{
+  if (a == b) return YES;
+  if (a == nil || b == nil) return a.length == 0 && b.length == 0;
+  return [a isEqualToString:b];
 }
 
 - (void)setPolylines:(NSArray *)polylines
@@ -406,8 +510,34 @@ using namespace facebook::react;
   if (!marker || !markerView) {
     return;
   }
-  marker.iconView = markerView;
-  marker.tracksViewChanges = YES;
+  // Rasterize the React-rendered view ONCE and reuse the resulting image
+  // on subsequent re-binds (cluster recomputes). Without this cache the
+  // GMSMarker would briefly flash its previous icon while the new
+  // iconView's first frame was being laid out.
+  CGSize size = markerView.bounds.size;
+  if (size.width <= 0 || size.height <= 0) {
+    marker.iconView = markerView;
+    marker.tracksViewChanges = YES;
+    return;
+  }
+  NSString *cacheKey = [NSString stringWithFormat:@"view:%@:%p:%.0fx%.0f",
+                        markerId, (void *)markerView, size.width, size.height];
+  UIImage *cached = [self.viewBitmapCache objectForKey:cacheKey];
+  if (!cached) {
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
+    cached = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
+      [markerView drawViewHierarchyInRect:markerView.bounds afterScreenUpdates:YES];
+    }];
+    [self.viewBitmapCache setObject:cached forKey:cacheKey];
+  }
+  marker.icon = cached;
+  marker.groundAnchor = CGPointMake(0.5, 1);
+  // tracksViewChanges = NO so GMS doesn't try to keep redrawing a UIView
+  // we've already rasterized. The render-then-cache pattern is what
+  // eliminates the per-frame flicker on cluster transitions.
+  marker.tracksViewChanges = NO;
 }
 
 - (void)mapView:(GMSMapView *)mapView didTapAtCoordinate:(CLLocationCoordinate2D)coordinate
@@ -601,18 +731,180 @@ using namespace facebook::react;
 {
   NSString *source = [RCTConvert NSString:item[@"icon"]] ?: [RCTConvert NSString:item[@"image"]];
   if (source.length > 0) {
-    UIImage *image = [UIImage imageNamed:source];
-    if (!image) {
-      NSURL *url = [NSURL URLWithString:source];
-      if (url.isFileURL) {
-        image = [UIImage imageWithContentsOfFile:url.path];
-      }
+    // Bundled asset / file URL — synchronous.
+    UIImage *bundled = [UIImage imageNamed:source];
+    if (bundled) return bundled;
+    NSURL *url = [NSURL URLWithString:source];
+    if (url.isFileURL) {
+      UIImage *file = [UIImage imageWithContentsOfFile:url.path];
+      if (file) return file;
     }
-    if (image) {
-      return image;
-    }
+    // Remote URL — check the cache; otherwise fall through to placeholder.
+    UIImage *cached = [self.iconCache objectForKey:source];
+    if (cached) return cached;
   }
-  return [GMSMarker markerImageWithColor:[self colorFromString:[RCTConvert NSString:item[@"pinColor"]] fallback:UIColor.redColor]];
+  return [self placeholderImageForItem:item];
+}
+
+/**
+ * Builds (or fetches from cache) the colored-disc placeholder that's shown
+ * as the very first icon for any marker whose real bitmap hasn't landed
+ * yet. The platform-default red pin is NEVER returned from this method —
+ * even when no fallback config is supplied, a neutral blue disc is drawn.
+ */
+- (UIImage *)placeholderImageForItem:(NSDictionary *)item
+{
+  NSString *discColorString = [RCTConvert NSString:item[@"fallbackColor"]];
+  NSString *ringColorString = [RCTConvert NSString:item[@"fallbackRingColor"]];
+  NSString *initialString = [RCTConvert NSString:item[@"fallbackInitial"]];
+  NSString *pinColorString = [RCTConvert NSString:item[@"pinColor"]];
+  UIColor *discColor =
+      [self colorFromString:discColorString
+                   fallback:[self colorFromString:pinColorString
+                                         fallback:[UIColor colorWithRed:0.122 green:0.435 blue:0.922 alpha:1]]];
+  UIColor *ringColor = [self colorFromString:ringColorString fallback:UIColor.whiteColor];
+  NSString *initial = initialString.length > 0 ? [initialString substringToIndex:1] : @"";
+
+  CGFloat size = 42.0;
+  NSString *key = [NSString stringWithFormat:@"ph:%@:%@:%@:%.0f",
+                   discColorString ?: @"", ringColorString ?: @"", initial, size];
+  UIImage *existing = [self.placeholderCache objectForKey:key];
+  if (existing) return existing;
+
+  UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+  fmt.opaque = NO;
+  UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
+      initWithSize:CGSizeMake(size, size) format:fmt];
+  UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
+    CGContextRef cg = ctx.CGContext;
+    // Ring
+    CGContextSetFillColorWithColor(cg, ringColor.CGColor);
+    CGContextFillEllipseInRect(cg, CGRectMake(0, 0, size, size));
+    // Inner disc inset by 2.5pt so the ring is visible
+    CGContextSetFillColorWithColor(cg, discColor.CGColor);
+    CGContextFillEllipseInRect(cg, CGRectMake(2.5, 2.5, size - 5, size - 5));
+    if (initial.length > 0) {
+      NSDictionary *attrs = @{
+        NSFontAttributeName: [UIFont boldSystemFontOfSize:size * 0.5],
+        NSForegroundColorAttributeName: UIColor.whiteColor
+      };
+      CGSize textSize = [initial sizeWithAttributes:attrs];
+      [[initial uppercaseString]
+          drawAtPoint:CGPointMake((size - textSize.width) / 2, (size - textSize.height) / 2)
+       withAttributes:attrs];
+    }
+  }];
+  [self.placeholderCache setObject:image forKey:key];
+  return image;
+}
+
+/**
+ * Async loader. If the source URL is remote and not already cached, fetch
+ * it on a background queue and swap the marker's icon when it lands.
+ * Identical URLs requested concurrently share a single in-flight request
+ * via the `iconWaiters` map.
+ */
+- (void)ensureMarkerIcon:(GMSMarker *)marker
+              identifier:(NSString *)identifier
+                  source:(NSString *)source
+                    item:(NSDictionary *)item
+{
+  if (source.length == 0) return;
+  if (![source hasPrefix:@"http://"] && ![source hasPrefix:@"https://"]) return;
+  UIImage *cached = [self.iconCache objectForKey:source];
+  if (cached) {
+    marker.icon = cached;
+    return;
+  }
+
+  __weak __typeof(self) weakSelf = self;
+  void (^onReady)(UIImage *) = ^(UIImage *image) {
+    __strong __typeof(self) strongSelf = weakSelf;
+    if (!strongSelf) return;
+    GMSMarker *current = strongSelf.markersById[identifier];
+    if (current != marker) return; // marker was recycled
+    marker.icon = image;
+  };
+
+  @synchronized (self.iconWaiters) {
+    NSMutableArray *existing = self.iconWaiters[source];
+    if (existing) {
+      [existing addObject:[onReady copy]];
+      return;
+    }
+    self.iconWaiters[source] = [@[[onReady copy]] mutableCopy];
+  }
+
+  NSURL *url = [NSURL URLWithString:source];
+  if (!url) {
+    [self flushIconWaitersForSource:source withImage:nil];
+    return;
+  }
+  NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+      dataTaskWithURL:url
+    completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        UIImage *image = (data && !error) ? [UIImage imageWithData:data] : nil;
+        __strong __typeof(self) strongSelf = weakSelf;
+        if (image && strongSelf) {
+          [strongSelf.iconCache setObject:image forKey:source];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+          __strong __typeof(self) self2 = weakSelf;
+          if (self2) [self2 flushIconWaitersForSource:source withImage:image];
+        });
+    }];
+  [task resume];
+}
+
+- (void)flushIconWaitersForSource:(NSString *)source withImage:(UIImage *)image
+{
+  NSArray *waiters;
+  @synchronized (self.iconWaiters) {
+    waiters = self.iconWaiters[source];
+    [self.iconWaiters removeObjectForKey:source];
+  }
+  if (!image) return;
+  for (void (^block)(UIImage *) in waiters) {
+    block(image);
+  }
+}
+
+- (void)prefetchMarkerIcons:(NSArray<NSString *> *)urls
+{
+  for (NSString *u in urls ?: @[]) {
+    if (![u isKindOfClass:[NSString class]] || u.length == 0) continue;
+    if ([self.iconCache objectForKey:u]) continue;
+    if (![u hasPrefix:@"http://"] && ![u hasPrefix:@"https://"]) continue;
+    __weak __typeof(self) weakSelf = self;
+    NSURL *url = [NSURL URLWithString:u];
+    if (!url) continue;
+    @synchronized (self.iconWaiters) {
+      if (self.iconWaiters[u]) continue; // already in flight
+      // Empty waiters array — load is pending but nobody is listening.
+      self.iconWaiters[u] = [NSMutableArray new];
+    }
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+        dataTaskWithURL:url
+      completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+          UIImage *image = (data && !error) ? [UIImage imageWithData:data] : nil;
+          __strong __typeof(self) strongSelf = weakSelf;
+          if (image && strongSelf) {
+            [strongSelf.iconCache setObject:image forKey:u];
+          }
+          dispatch_async(dispatch_get_main_queue(), ^{
+            __strong __typeof(self) self2 = weakSelf;
+            if (self2) [self2 flushIconWaitersForSource:u withImage:image];
+          });
+      }];
+    [task resume];
+  }
+}
+
+- (void)clearMarkerIconCache
+{
+  [self.iconCache removeAllObjects];
+  [self.placeholderCache removeAllObjects];
+  [self.viewBitmapCache removeAllObjects];
 }
 
 - (float)zoomFromLongitudeDelta:(double)longitudeDelta

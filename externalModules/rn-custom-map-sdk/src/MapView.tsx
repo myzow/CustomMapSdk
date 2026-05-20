@@ -23,12 +23,16 @@ import Callout from './Callout';
 import Circle from './Circle';
 import Marker from './Marker';
 import Polyline from './Polyline';
+import MarkerPlaceholder from './Placeholder';
 import { clusterPoints, type Cluster as EngineCluster, type ClusterPoint } from './clustering/cluster';
 import {
   shouldRecompute,
   zoomBucketKey,
   regionToZoom,
 } from './clustering/throttle';
+import { DragGate } from './clustering/dragGate';
+import { stableClusterKey } from './clustering/membership';
+import { defaultIconCache } from './clustering/iconCache';
 import type {
   Camera,
   CircleProps,
@@ -38,6 +42,7 @@ import type {
   MapViewMethods,
   MapViewProps,
   MarkerAnimationOptions,
+  MarkerFallback,
   MarkerMethods,
   MarkerProps,
   NativeCircle,
@@ -71,6 +76,9 @@ type MarkerMeta = {
   coordinate: Coordinate;
   data?: any;
   title?: string;
+  /** Cached resolved image URI so we can prefetch without re-resolving. */
+  imageUri?: string;
+  fallback?: MarkerFallback;
 };
 
 function childTypeName(child: React.ReactElement) {
@@ -144,6 +152,7 @@ function parseChildren(children: React.ReactNode) {
       const callout = getMarkerCallout(child as React.ReactElement<MarkerProps>);
       const customChildren = getMarkerCustomChildren(child as React.ReactElement<MarkerProps>);
       const markerRef = (child as any).ref ?? (child.props as any).ref;
+      const fallback = props.fallback;
 
       markers.push(compactObject({
         id,
@@ -154,6 +163,9 @@ function parseChildren(children: React.ReactNode) {
         pinColor: props.pinColor,
         image: resolveImageSource(props.image),
         icon: resolveImageSource(props.icon),
+        fallbackColor: fallback?.color,
+        fallbackInitial: fallback?.initial,
+        fallbackRingColor: fallback?.ringColor,
         centerOffset: props.centerOffset,
         calloutOffset: props.calloutOffset,
         anchor: props.anchor,
@@ -169,7 +181,16 @@ function parseChildren(children: React.ReactNode) {
 
       // userData is an alias of data; explicit `data` wins.
       const data = props.data !== undefined ? props.data : props.userData;
-      markerMeta.set(id, { id, coordinate: props.coordinate, data, title: props.title });
+      const resolvedImageUri =
+        resolveImageSource(props.image) ?? resolveImageSource(props.icon);
+      markerMeta.set(id, {
+        id,
+        coordinate: props.coordinate,
+        data,
+        title: props.title,
+        imageUri: resolvedImageUri,
+        fallback,
+      });
 
       if (markerRef) markerRefs.set(id, markerRef);
       if (customChildren) markerSnapshots.push({ id, children: customChildren });
@@ -259,8 +280,22 @@ function fitOptions(options?: number | { animated?: boolean; padding?: number; e
   };
 }
 
-/** Default cluster visual used when the consumer didn't provide one. */
+/**
+ * Default cluster visual used when the consumer didn't provide one. For
+ * singleton clusters (count === 1), and when the original marker has a
+ * `fallback` config, we render the user-provided MarkerPlaceholder so the
+ * first frame is on-brand. For multi-clusters we render a numeric bubble.
+ *
+ * This is what guarantees no Google pin ever appears — even consumers who
+ * forget to set up renderCluster get a styled placeholder.
+ */
 function DefaultClusterBubble({ cluster }: { cluster: Cluster }) {
+  if (cluster.pointCount === 1) {
+    const member = cluster.markers[0];
+    const meta = member?.data as { fallback?: MarkerFallback } | undefined;
+    const fallback = meta?.fallback;
+    return <MarkerPlaceholder fallback={fallback} />;
+  }
   return (
     <View style={defaultClusterStyles.bubble}>
       <Text style={defaultClusterStyles.text}>{cluster.pointCount}</Text>
@@ -434,6 +469,23 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     const clusterCacheRef = useRef<Map<string, Cluster[]>>(new Map());
     /** Pending debounce handle for the "settle then recompute" timer. */
     const recomputeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    /**
+     * Drag-aware gate. Lives for the lifetime of the MapView. The gate is
+     * the SINGLE source of truth for "is the user mid-gesture?", which is
+     * the answer that decides whether we run clustering on each event.
+     * Without this gate, every region-change during a pinch fires a fresh
+     * cluster pass, which in turn re-creates native markers and produces
+     * the perceptible default-pin flicker.
+     */
+    const dragGateRef = useRef<DragGate>(
+      new DragGate({ debounceMs, gestureSettleMs: Math.max(debounceMs * 2, 150) }),
+    );
+    /**
+     * Drag state mirrored into React so the render path can suppress
+     * non-essential work (snapshot-view reflow, prefetching) while a
+     * gesture is in flight.
+     */
+    const [isDragging, setIsDragging] = useState<boolean>(false);
 
     /**
      * Splits the marker meta map into "passthrough" (kept as-is, e.g. items
@@ -549,27 +601,60 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     }, [recompute]);
 
     /**
-     * Schedule a debounced threshold check. Called when the camera *settles*
-     * (region-change-complete). The check itself runs after `debounceMs` so
-     * that rapid successive settles collapse into a single recompute.
+     * Run the deferred recompute path. Reads "live" region (which may have
+     * advanced since the gate started waiting) and only commits to the
+     * cluster engine when the camera has moved enough to matter.
      */
-    const scheduleRecomputeCheck = useCallback(() => {
+    const runDeferredRecompute = useCallback(() => {
       if (!clusteringEnabled) return;
-      if (recomputeTimerRef.current) clearTimeout(recomputeTimerRef.current);
-      recomputeTimerRef.current = setTimeout(() => {
-        recomputeTimerRef.current = null;
-        const live = liveRegionRef.current;
-        if (!live || viewport.width === 0 || viewport.height === 0) return;
-        const should = shouldRecompute({
-          previousRegion: lastComputedRegionRef.current,
-          currentRegion: live,
-          viewport,
-          renderThreshold,
-          dragThreshold,
-        });
-        if (should) setRegionForCompute(live);
-      }, Math.max(debounceMs, 0));
-    }, [clusteringEnabled, viewport, renderThreshold, dragThreshold, debounceMs]);
+      const live = liveRegionRef.current;
+      if (!live || viewport.width === 0 || viewport.height === 0) return;
+      const should = shouldRecompute({
+        previousRegion: lastComputedRegionRef.current,
+        currentRegion: live,
+        viewport,
+        renderThreshold,
+        dragThreshold,
+      });
+      if (should) setRegionForCompute(live);
+    }, [clusteringEnabled, viewport, renderThreshold, dragThreshold]);
+
+    /**
+     * Dispatch a `region-change` event to the drag gate and act on its
+     * decision. The renderer never schedules a recompute on its own anymore
+     * — it only obeys the gate.
+     */
+    const dispatchToGate = useCallback(
+      (
+        kind: 'region-change' | 'region-change-complete',
+        isGesture: boolean,
+      ) => {
+        if (!clusteringEnabled) return;
+        const decision = dragGateRef.current.handle({ type: kind, isGesture });
+        if (decision.isDragging !== isDragging) setIsDragging(decision.isDragging);
+        if (decision.shouldRecompute) {
+          // Should never happen for region-change / region-change-complete
+          // (gate only emits shouldRecompute on idle-timeout), but obey it
+          // defensively in case the gate's API ever changes.
+          runDeferredRecompute();
+          return;
+        }
+        if (decision.scheduleSettleCheck > 0) {
+          if (recomputeTimerRef.current) clearTimeout(recomputeTimerRef.current);
+          recomputeTimerRef.current = setTimeout(() => {
+            recomputeTimerRef.current = null;
+            const idleDecision = dragGateRef.current.handle({
+              type: 'idle-timeout',
+            });
+            if (idleDecision.isDragging !== isDragging) {
+              setIsDragging(idleDecision.isDragging);
+            }
+            if (idleDecision.shouldRecompute) runDeferredRecompute();
+          }, decision.scheduleSettleCheck);
+        }
+      },
+      [clusteringEnabled, isDragging, runDeferredRecompute],
+    );
 
     // Tear down any pending debounce on unmount.
     useEffect(() => {
@@ -580,6 +665,43 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         }
       };
     }, []);
+
+    // ------------------------------------------------------------------
+    // Icon prefetching — warms the native bitmap cache up-front
+    // ------------------------------------------------------------------
+    /**
+     * Collects every remote image URL referenced by the current marker set
+     * and asks the native module to warm its bitmap cache. Already-loaded
+     * URLs are deduplicated through `defaultIconCache` so the bridge sees
+     * only first-time entries. Runs whenever the marker set changes and is
+     * intentionally suppressed during drag (prefetching mid-pinch wastes
+     * cycles on URLs whose markers may have left the viewport by the time
+     * the bitmap lands).
+     */
+    useEffect(() => {
+      if (isDragging) return;
+      const urls: string[] = [];
+      for (const meta of parsed.markerMeta.values()) {
+        const uri = meta.imageUri;
+        if (!uri) continue;
+        if (!/^https?:/i.test(uri)) continue; // only remote images need warming
+        if (defaultIconCache.beginPrefetch(uri)) urls.push(uri);
+      }
+      if (urls.length === 0) return;
+      const tag = getReactTagSafe();
+      if (tag == null) return;
+      const prefetch = (NativeMapViewManager as any).prefetchMarkerIcons;
+      if (typeof prefetch !== 'function') return;
+      try {
+        prefetch(tag, urls);
+        // Optimistic: the native side will resolve / reject on its own.
+        // The cache stays in `pending` until we hear back, OR until the
+        // 500ms placeholder deadline elapses.
+        for (const u of urls) defaultIconCache.markLoaded(u);
+      } catch {
+        for (const u of urls) defaultIconCache.markFailed(u);
+      }
+    }, [parsed.markerMeta, getReactTagSafe, isDragging]);
 
     // ------------------------------------------------------------------
     // Cluster press dispatcher — default zoom-in behavior with overrides
@@ -684,9 +806,16 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         if (passthroughIds.has(m.id)) out.push(m);
       }
 
-      // 2) cluster results become synthetic markers.
+      // 2) cluster results become synthetic markers. We use the membership
+      //    signature (NOT the raw grid id) as the suffix, so a cluster that
+      //    keeps the same members across recomputes — even when it moves
+      //    between adjacent grid cells — retains the same native marker id.
+      //    This is the critical knob that lets the native side reuse its
+      //    cached BitmapDescriptor / UIImage instead of recreating the
+      //    marker (and showing a default pin for a frame).
       for (const c of clusters) {
-        const id = `${CLUSTER_MARKER_PREFIX}${c.id}`;
+        const stableId = stableClusterKey(c);
+        const id = `${CLUSTER_MARKER_PREFIX}${stableId}`;
         byId.set(id, c);
         out.push({
           id,
@@ -763,26 +892,32 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     );
 
     // ------------------------------------------------------------------
-    // Region tracking — needed to recluster on zoom, gated by debounce +
-    // renderThreshold + dragThreshold to keep the bubble layer stable.
+    // Region tracking — feeds into the drag gate. Clustering only ever
+    // recomputes via gate-emitted idle-timeout events, NEVER directly off
+    // raw region-change-complete, which would re-fire during fling decay.
     // ------------------------------------------------------------------
     const handleRegionChange = useCallback(
       (event: EventPayload<{ region: Region; details?: RegionChangeDetails }>) => {
-        // Track only. NEVER recompute mid-drag.
-        if (clusteringEnabled) liveRegionRef.current = event.nativeEvent.region;
+        if (clusteringEnabled) {
+          liveRegionRef.current = event.nativeEvent.region;
+          dispatchToGate('region-change', !!event.nativeEvent.details?.isGesture);
+        }
         onRegionChange?.(event.nativeEvent.region, event.nativeEvent.details);
       },
-      [clusteringEnabled, onRegionChange],
+      [clusteringEnabled, onRegionChange, dispatchToGate],
     );
     const handleRegionChangeComplete = useCallback(
       (event: EventPayload<{ region: Region; details?: RegionChangeDetails }>) => {
         if (clusteringEnabled) {
           liveRegionRef.current = event.nativeEvent.region;
-          scheduleRecomputeCheck();
+          dispatchToGate(
+            'region-change-complete',
+            !!event.nativeEvent.details?.isGesture,
+          );
         }
         onRegionChangeComplete?.(event.nativeEvent.region, event.nativeEvent.details);
       },
-      [clusteringEnabled, onRegionChangeComplete, scheduleRecomputeCheck],
+      [clusteringEnabled, onRegionChangeComplete, dispatchToGate],
     );
 
     return (

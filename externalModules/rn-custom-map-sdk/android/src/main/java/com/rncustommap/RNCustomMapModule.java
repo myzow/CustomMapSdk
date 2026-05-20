@@ -347,4 +347,30 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
       }
     });
   }
+
+  // -------------------- Native icon cache --------------------
+
+  /**
+   * Pre-warms the process-wide BitmapDescriptor cache for a batch of URLs.
+   * JS hands us only URLs it has NOT already seen (see
+   * `src/clustering/iconCache.ts`), so this can be called freely on every
+   * marker-set change without spamming the network.
+   */
+  @Override
+  public void prefetchMarkerIcons(double reactTag, ReadableArray urls) {
+    withMap((int) reactTag, "prefetchMarkerIcons", view ->
+        RNCustomMapViewManagerImpl.prefetchMarkerIcons(view, urls));
+  }
+
+  /**
+   * Drops the process-wide BitmapDescriptor cache. The native side ALSO
+   * drops it automatically on {@link android.content.ComponentCallbacks2#onTrimMemory}
+   * — this entry point exists for hosts that want to force-clear after a
+   * controlled large gallery is no longer needed.
+   */
+  @Override
+  public void clearMarkerIconCache(double reactTag) {
+    withMap((int) reactTag, "clearMarkerIconCache",
+        RNCustomMapViewManagerImpl::clearMarkerIconCache);
+  }
 }

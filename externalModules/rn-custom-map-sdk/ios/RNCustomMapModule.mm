@@ -129,6 +129,20 @@ RCT_EXPORT_METHOD(computeClusters:(nonnull NSNumber *)reactTag
   }];
 }
 
+RCT_EXPORT_METHOD(prefetchMarkerIcons:(nonnull NSNumber *)reactTag urls:(NSArray<NSString *> *)urls)
+{
+  [self withMap:reactTag block:^(RNCustomMapNativeView *view) {
+    [view prefetchMarkerIcons:urls];
+  }];
+}
+
+RCT_EXPORT_METHOD(clearMarkerIconCache:(nonnull NSNumber *)reactTag)
+{
+  [self withMap:reactTag block:^(RNCustomMapNativeView *view) {
+    [view clearMarkerIconCache];
+  }];
+}
+
 - (void)withMap:(NSNumber *)reactTag block:(void (^)(RNCustomMapNativeView *view))block
 {
   dispatch_async(dispatch_get_main_queue(), ^{

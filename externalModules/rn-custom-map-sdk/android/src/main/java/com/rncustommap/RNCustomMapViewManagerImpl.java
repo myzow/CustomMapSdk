@@ -14,6 +14,7 @@ import android.view.animation.AccelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
 import android.view.animation.LinearInterpolator;
 import android.view.animation.Interpolator;
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.core.content.ContextCompat;
 import com.bumptech.glide.Glide;
@@ -30,6 +31,7 @@ import com.facebook.react.uimanager.UIManagerHelper;
 import com.facebook.react.uimanager.common.UIManagerType;
 import com.google.android.gms.maps.CameraUpdateFactory;
 import com.google.android.gms.maps.GoogleMap;
+import com.google.android.gms.maps.model.BitmapDescriptor;
 import com.google.android.gms.maps.model.BitmapDescriptorFactory;
 import com.google.android.gms.maps.model.CircleOptions;
 import com.google.android.gms.maps.model.Dash;
@@ -135,20 +137,68 @@ public final class RNCustomMapViewManagerImpl {
 
   static void setMarkers(RNCustomMapView view, @Nullable ReadableArray markers) {
     view.whenReady(() -> {
-      for (Marker marker : view.markers.values()) {
-        marker.remove();
-      }
-      view.markers.clear();
-      view.markerPayloads.clear();
-      view.markerTappables.clear();
-      view.markerIconTargets.clear();
+      // ----------------------------------------------------------------
+      // Diff-based update — the original implementation removed ALL
+      // markers then re-created them, which was the root cause of the
+      // perceptible flicker during pan/zoom/cluster transitions. Each
+      // freshly-created Marker shows the default red pin for a few frames
+      // until its bitmap is decoded. We now reuse the existing Marker
+      // when the id is unchanged and only mutate the fields that differ.
+      // ----------------------------------------------------------------
+      MarkerIconCache cache = MarkerIconCache.get(view.getContext());
 
-      if (markers == null) {
-        return;
+      Map<String, ReadableMap> incoming = new HashMap<>();
+      if (markers != null) {
+        for (int i = 0; i < markers.size(); i++) {
+          ReadableMap item = markers.getMap(i);
+          String id = item.hasKey("id") ? item.getString("id") : "marker-" + i;
+          incoming.put(id, item);
+        }
       }
-      for (int i = 0; i < markers.size(); i++) {
-        ReadableMap item = markers.getMap(i);
-        String id = item.hasKey("id") ? item.getString("id") : "marker-" + i;
+
+      // 1) Remove markers that are no longer in the incoming set.
+      List<String> toRemove = new ArrayList<>();
+      for (String existingId : view.markers.keySet()) {
+        if (!incoming.containsKey(existingId)) toRemove.add(existingId);
+      }
+      for (String id : toRemove) {
+        Marker m = view.markers.remove(id);
+        if (m != null) m.remove();
+        view.markerPayloads.remove(id);
+        view.markerTappables.remove(id);
+        view.markerIconTargets.remove(id);
+      }
+
+      // 2) Reuse / create entries.
+      for (Map.Entry<String, ReadableMap> e : incoming.entrySet()) {
+        String id = e.getKey();
+        ReadableMap item = e.getValue();
+        Marker existing = view.markers.get(id);
+        if (existing != null) {
+          // Reuse: only move + update mutable fields. The icon is left
+          // alone unless the source URL changed; in that case we use the
+          // cached descriptor when available so the user never sees a pin.
+          LatLng newPos = new LatLng(item.getDouble("latitude"), item.getDouble("longitude"));
+          if (!existing.getPosition().equals(newPos)) {
+            existing.setPosition(newPos);
+          }
+          existing.setAlpha((float) getDouble(item, "opacity", existing.getAlpha()));
+          existing.setRotation((float) getDouble(item, "rotation", existing.getRotation()));
+          existing.setFlat(getBoolean(item, "flat", existing.isFlat()));
+          existing.setDraggable(getBoolean(item, "draggable", existing.isDraggable()));
+          applyAnchorToMarker(existing, item);
+
+          String newSource = getString(item, "icon");
+          if (newSource == null) newSource = getString(item, "image");
+          ensureMarkerIcon(view, cache, existing, id, item, newSource);
+
+          view.markerPayloads.put(id, markerPayload(id, item));
+          view.markerTappables.put(id, getBoolean(item, "tappable", true));
+          continue;
+        }
+
+        // Fresh marker — apply placeholder icon synchronously so the user
+        // never sees the default Google pin.
         MarkerOptions options = new MarkerOptions()
             .position(new LatLng(item.getDouble("latitude"), item.getDouble("longitude")))
             .title(getString(item, "title"))
@@ -158,17 +208,137 @@ public final class RNCustomMapViewManagerImpl {
             .rotation((float) getDouble(item, "rotation", 0d))
             .alpha((float) getDouble(item, "opacity", 1d));
         applyAnchor(options, item);
-        applyInitialMarkerIcon(options, item);
-        Marker marker = view.googleMap.addMarker(options);
-        if (marker != null) {
-          marker.setTag(id);
-          view.markers.put(id, marker);
-          view.markerPayloads.put(id, markerPayload(id, item));
-          view.markerTappables.put(id, getBoolean(item, "tappable", true));
-          loadRemoteMarkerIcon(view, marker, id, item);
-        }
+        BitmapDescriptor initialIcon = resolveInitialIcon(view, cache, item);
+        options.icon(initialIcon);
+
+        Marker created = view.googleMap.addMarker(options);
+        if (created == null) continue;
+        created.setTag(id);
+        view.markers.put(id, created);
+        view.markerPayloads.put(id, markerPayload(id, item));
+        view.markerTappables.put(id, getBoolean(item, "tappable", true));
+
+        String source = getString(item, "icon");
+        if (source == null) source = getString(item, "image");
+        ensureMarkerIcon(view, cache, created, id, item, source);
       }
     });
+  }
+
+  /**
+   * Synchronously chooses the very first icon a marker should show. We
+   * NEVER fall back to {@link BitmapDescriptorFactory#defaultMarker} —
+   * if there is no source and no pinColor, a neutral placeholder disc is
+   * drawn from {@link MarkerIconCache#placeholder}.
+   */
+  private static BitmapDescriptor resolveInitialIcon(
+      RNCustomMapView view, MarkerIconCache cache, ReadableMap item) {
+    String source = getString(item, "icon");
+    if (source == null) source = getString(item, "image");
+    if (source != null && source.length() > 0) {
+      try {
+        Uri uri = Uri.parse(source);
+        String scheme = uri.getScheme();
+        if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
+          BitmapDescriptor cached = cache.lookup(source);
+          if (cached != null) return cached;
+          // Fall through to placeholder while Glide loads.
+        } else {
+          // Local asset — Google Maps caches these natively.
+          if ("file".equalsIgnoreCase(scheme)) {
+            return BitmapDescriptorFactory.fromPath(uri.getPath());
+          }
+          return BitmapDescriptorFactory.fromPath(source);
+        }
+      } catch (RuntimeException ignored) {
+        /* fall through to placeholder */
+      }
+    }
+    int disc = parseColor(getString(item, "fallbackColor"),
+        parseColor(getString(item, "pinColor"), Color.rgb(31, 111, 235)));
+    int ring = parseColor(getString(item, "fallbackRingColor"), Color.WHITE);
+    String initial = getString(item, "fallbackInitial");
+    return cache.placeholder(disc, ring, initial, 84);
+  }
+
+  /**
+   * Hooks the cache to keep the marker's icon up-to-date. If the source is
+   * a remote URL we request it through the cache; the cache calls back on
+   * the main thread once the bitmap lands. If the marker has already been
+   * removed by the time the callback fires (cluster transitions can do
+   * this), we drop the result silently.
+   */
+  private static void ensureMarkerIcon(
+      final RNCustomMapView view,
+      final MarkerIconCache cache,
+      final Marker marker,
+      final String markerId,
+      ReadableMap item,
+      @Nullable final String source) {
+    if (source == null || source.length() == 0) return;
+    Uri uri;
+    try {
+      uri = Uri.parse(source);
+    } catch (RuntimeException ignored) {
+      return;
+    }
+    String scheme = uri.getScheme();
+    if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
+      // Local — applied synchronously above.
+      return;
+    }
+    BitmapDescriptor cached = cache.lookup(source);
+    if (cached != null) {
+      marker.setIcon(cached);
+      marker.setAnchor(0.5f, 1f);
+      return;
+    }
+    cache.requestRemote(
+        view.getContext(),
+        source,
+        new MarkerIconCache.IconReadyListener() {
+          @Override
+          public void onIconReady(@NonNull String url, @NonNull BitmapDescriptor descriptor) {
+            // The marker may have been recycled by a subsequent setMarkers
+            // call. Only update if it's still the same entry.
+            Marker current = view.markers.get(markerId);
+            if (current != marker) return;
+            marker.setIcon(descriptor);
+            marker.setAnchor(0.5f, 1f);
+          }
+
+          @Override
+          public void onIconFailed(@NonNull String url) {
+            // Placeholder stays — we'll show the user-styled disc
+            // indefinitely. The JS retry pipeline will reissue prefetch
+            // in the background.
+          }
+        });
+  }
+
+  private static void applyAnchorToMarker(Marker marker, ReadableMap item) {
+    if (item.hasKey("anchor") && !item.isNull("anchor")) {
+      ReadableMap anchor = item.getMap("anchor");
+      marker.setAnchor((float) getDouble(anchor, "x", 0.5d), (float) getDouble(anchor, "y", 1d));
+    } else {
+      marker.setAnchor(0.5f, 1f);
+    }
+  }
+
+  /** Native-side prefetch entry point — invoked from RNCustomMapModule. */
+  static void prefetchMarkerIcons(RNCustomMapView view, ReadableArray urls) {
+    if (urls == null) return;
+    MarkerIconCache cache = MarkerIconCache.get(view.getContext());
+    for (int i = 0; i < urls.size(); i++) {
+      String url = urls.getString(i);
+      if (url == null || url.isEmpty()) continue;
+      cache.prefetch(view.getContext(), url);
+    }
+  }
+
+  /** Clears the entire native icon cache. Used by clearMarkerIconCache. */
+  static void clearMarkerIconCache(RNCustomMapView view) {
+    MarkerIconCache.get(view.getContext()).clear();
   }
 
   // static void showMarkerCallout(RNCustomMapView view, String markerId) {
@@ -272,13 +442,24 @@ public final class RNCustomMapViewManagerImpl {
       if (marker == null || markerView.getWidth() <= 0 || markerView.getHeight() <= 0) {
         return;
       }
-      Bitmap bitmap = Bitmap.createBitmap(
-          markerView.getWidth(),
-          markerView.getHeight(),
-          Bitmap.Config.ARGB_8888);
-      Canvas canvas = new Canvas(bitmap);
-      markerView.draw(canvas);
-      marker.setIcon(BitmapDescriptorFactory.fromBitmap(bitmap));
+      // Rasterize the React-rendered view ONCE and reuse the resulting
+      // bitmap on subsequent calls with the same view tag + size. Without
+      // this cache, every cluster recompute re-runs draw(canvas) which is
+      // expensive AND visibly toggles between the previous bitmap and the
+      // new one (the source of mid-cluster flicker on Android).
+      int viewKey = System.identityHashCode(markerView);
+      int w = markerView.getWidth();
+      int h = markerView.getHeight();
+      String cacheKey = "view:" + markerId + ":" + viewKey + ":" + w + "x" + h;
+      BitmapDescriptor cached = mapView.markerViewBitmaps.get(cacheKey);
+      if (cached == null) {
+        Bitmap bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        markerView.draw(canvas);
+        cached = BitmapDescriptorFactory.fromBitmap(bitmap);
+        mapView.markerViewBitmaps.put(cacheKey, cached);
+      }
+      marker.setIcon(cached);
       marker.setAnchor(0.5f, 1f);
     });
   }
@@ -549,67 +730,11 @@ public final class RNCustomMapViewManagerImpl {
     }
   }
 
-  private static void applyInitialMarkerIcon(MarkerOptions options, ReadableMap item) {
-    String source = getString(item, "icon");
-    if (source == null) {
-      source = getString(item, "image");
-    }
-    if (source != null && source.length() > 0) {
-      try {
-        Uri uri = Uri.parse(source);
-        String scheme = uri.getScheme();
-        if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
-          applyPinColor(options, item);
-          return;
-        }
-        if ("file".equals(uri.getScheme())) {
-          options.icon(BitmapDescriptorFactory.fromPath(uri.getPath()));
-        } else {
-          options.icon(BitmapDescriptorFactory.fromPath(source));
-        }
-        return;
-      } catch (RuntimeException ignored) {
-        // Fall back to pin color/default marker.
-      }
-    }
-    applyPinColor(options, item);
-  }
-
   private static void applyPinColor(MarkerOptions options, ReadableMap item) {
     String pinColor = getString(item, "pinColor");
     if (pinColor != null) {
       options.icon(BitmapDescriptorFactory.defaultMarker(hueForColor(parseColor(pinColor, Color.RED))));
     }
-  }
-
-  private static void loadRemoteMarkerIcon(RNCustomMapView view, Marker marker, String markerId, ReadableMap item) {
-    String source = getString(item, "icon");
-    if (source == null) {
-      source = getString(item, "image");
-    }
-    if (source == null) {
-      return;
-    }
-    Uri uri = Uri.parse(source);
-    String scheme = uri.getScheme();
-    if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
-      return;
-    }
-    CustomTarget<Bitmap> target = new CustomTarget<Bitmap>() {
-      @Override
-      public void onResourceReady(Bitmap resource, @Nullable Transition<? super Bitmap> transition) {
-        marker.setIcon(BitmapDescriptorFactory.fromBitmap(resource));
-        marker.setAnchor(0.5f, 1f);
-        view.markerIconTargets.remove(markerId);
-      }
-
-      @Override
-      public void onLoadCleared(@Nullable android.graphics.drawable.Drawable placeholder) {
-        view.markerIconTargets.remove(markerId);
-      }
-    };
-    view.markerIconTargets.put(markerId, target);
-    Glide.with(view).asBitmap().load(source).into(target);
   }
 
   private static Interpolator markerInterpolator(@Nullable ReadableMap options) {

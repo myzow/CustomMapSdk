@@ -42,6 +42,9 @@ type NativeMarker = Readonly<{
   pinColor?: WithDefault<string, ''>;
   image?: WithDefault<string, ''>;
   icon?: WithDefault<string, ''>;
+  fallbackColor?: WithDefault<string, ''>;
+  fallbackInitial?: WithDefault<string, ''>;
+  fallbackRingColor?: WithDefault<string, ''>;
   centerOffset?: Point;
   calloutOffset?: Point;
   anchor?: Point;

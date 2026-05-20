@@ -99,6 +99,8 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
   final Map<String, WritableMap> markerPayloads = new HashMap<>();
   final Map<String, Boolean> markerTappables = new HashMap<>();
   final Map<String, CustomTarget<android.graphics.Bitmap>> markerIconTargets = new HashMap<>();
+  /** Cache of rasterized React-view bitmaps keyed by (markerId+viewIdentity+size). */
+  final Map<String, com.google.android.gms.maps.model.BitmapDescriptor> markerViewBitmaps = new HashMap<>();
 
   private final List<Runnable> pending = new ArrayList<>();
   @Nullable String selectedMarkerId;

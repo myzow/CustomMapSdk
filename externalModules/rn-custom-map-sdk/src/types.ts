@@ -163,6 +163,24 @@ export type ClusterConfig = {
   customOnPress?: (cluster: Cluster) => void;
 };
 
+/**
+ * Visual fallback shown while a marker's custom image is still loading,
+ * or when it fails to load. Used by {@link MarkerPlaceholder} and the
+ * native side's synthesized fallback bitmap. The platform-default pin is
+ * NEVER displayed — `MarkerFallback` is what the user sees instead.
+ */
+export type MarkerFallback = {
+  /** Solid color of the placeholder disc. Default: '#1f6feb' (brand blue). */
+  color?: string;
+  /** Ring (border) color of the disc. Default: white. */
+  ringColor?: string;
+  /**
+   * Optional one-character initial drawn on top of the disc (the first
+   * Unicode code point is used; longer strings are truncated).
+   */
+  initial?: string;
+};
+
 export interface MarkerProps {
   id?: string;
   identifier?: string;
@@ -172,6 +190,12 @@ export interface MarkerProps {
   pinColor?: string;
   image?: ImageSourcePropType;
   icon?: ImageSourcePropType;
+  /**
+   * Visual fallback shown until the custom image is loaded into the native
+   * bitmap cache, OR if the image fails to load. The SDK never displays
+   * the platform-default pin: this fallback is the guaranteed first frame.
+   */
+  fallback?: MarkerFallback;
   centerOffset?: Point;
   calloutOffset?: Point;
   anchor?: Point;
@@ -276,6 +300,12 @@ export type NativeMarker = {
   pinColor?: string;
   image?: string;
   icon?: string;
+  /** Hex color of the fallback disc bitmap drawn before the icon loads. */
+  fallbackColor?: string;
+  /** One-character initial drawn over the fallback disc, if any. */
+  fallbackInitial?: string;
+  /** Hex color of the disc's outer ring. Default white. */
+  fallbackRingColor?: string;
   centerOffset?: Point;
   calloutOffset?: Point;
   anchor?: Point;

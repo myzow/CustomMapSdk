@@ -18,6 +18,7 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 
 import TabbedMapScreen from './src/screens/TabbedMapScreen';
 import ClusteringScreen from './src/screens/ClusteringScreen';
+import AllMarkersScreen from './src/screens/AllMarkersScreen';
 
 const Tab = createBottomTabNavigator();
 
@@ -88,6 +89,15 @@ export default function App() {
           options={{
             title: 'Clustering',
             tabBarIcon: ({ color }) => tabIcon('CL', color),
+          }}
+        />
+
+        <Tab.Screen
+          name="AllMarkers"
+          component={AllMarkersScreen}
+          options={{
+            title: 'All Markers',
+            tabBarIcon: ({ color }) => tabIcon('AL', color),
           }}
         />
       </Tab.Navigator>

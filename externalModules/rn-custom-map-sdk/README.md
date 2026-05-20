@@ -73,3 +73,54 @@ export default function App() {
   );
 }
 ```
+
+## Flicker-free markers
+
+The SDK ships with a 3-tier pipeline that prevents the default Google /
+Apple pin from ever flashing during zoom, drag, or cluster transitions:
+
+1. **Native icon cache** (Android: `BitmapDescriptor` LRU,
+   iOS: `NSCache<NSString*, UIImage*>`). Bitmaps survive across
+   cluster recomputes and are released automatically under memory
+   pressure (`onTrimMemory` / `UIApplicationDidReceiveMemoryWarning`).
+2. **Diff-based marker updates**. `setMarkers` reuses existing native
+   marker instances when ids are unchanged, so cluster transitions no
+   longer destroy + recreate the underlying GMSMarker/Marker.
+3. **Branded placeholder fallback** (`<MarkerPlaceholder />` JS,
+   colored-disc bitmap on native). Shown as the very first icon when a
+   remote image is still loading or after the 500 ms cutoff. The
+   default platform pin is never used.
+
+Add a fallback to any marker:
+
+```tsx
+<Marker
+  identifier={place.id}
+  coordinate={place.coordinate}
+  fallback={{ color: '#1f6feb', initial: place.name.charAt(0) }}
+/>
+```
+
+Drag-aware clustering is automatic: while a gesture is in flight the
+cluster pipeline is paused. Exactly one recompute fires on the trailing
+edge of a drag, after the camera settles. Tune via `clusterConfig`:
+
+```tsx
+clusterConfig={{
+  enabled: true,
+  radius: 64,
+  renderThreshold: 0.5,      // skip recompute below ½ zoom step
+  dragThreshold: 50,         // skip recompute under 50 px of pan
+  debounceMs: 100,           // settle period after programmatic moves
+  renderCluster: cluster => <ClusterBubble cluster={cluster} />,
+}}
+```
+
+Programmatically warm the icon cache for known URLs (e.g. when paginating
+a feed):
+
+```tsx
+import NativeMapViewManager from 'rn-custom-map-sdk/spec/NativeRNCustomMapViewManager';
+
+NativeMapViewManager.prefetchMarkerIcons(reactTag, urls);
+```

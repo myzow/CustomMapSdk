@@ -108,6 +108,21 @@ export interface Spec extends TurboModule {
       longitude: Double;
     }>
   >;
+
+  /**
+   * Asks the native side to warm its BitmapDescriptor / UIImage cache for
+   * the supplied URLs. Safe to call repeatedly — already-cached URLs are a
+   * no-op. JS coordinates which URLs are pending via
+   * `src/clustering/iconCache.ts` so the bridge isn't spammed.
+   */
+  prefetchMarkerIcons(reactTag: Int32, urls: Array<string>): void;
+
+  /**
+   * Drops the entire native icon cache. Used on explicit memory pressure
+   * (the native side also drops it automatically via onTrimMemory /
+   * UIApplicationDidReceiveMemoryWarningNotification).
+   */
+  clearMarkerIconCache(reactTag: Int32): void;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('RNCustomMapViewManager');

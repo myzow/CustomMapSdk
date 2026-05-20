@@ -33,6 +33,8 @@
 - (void)setMarkers:(NSArray *)markers;
 - (void)setPolylines:(NSArray *)polylines;
 - (void)setCircles:(NSArray *)circles;
+- (void)prefetchMarkerIcons:(NSArray<NSString *> *)urls;
+- (void)clearMarkerIconCache;
 - (NSArray *)currentMarkers;
 - (NSDictionary *)currentCamera;
 - (void)setCamera:(NSDictionary *)camera duration:(NSInteger)duration;
