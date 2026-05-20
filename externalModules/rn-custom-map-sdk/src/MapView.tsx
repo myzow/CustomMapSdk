@@ -32,6 +32,7 @@ import {
 } from './clustering/throttle';
 import { DragGate } from './clustering/dragGate';
 import { stableClusterKey } from './clustering/membership';
+import { resolveCluster } from './clustering/markerType';
 import { defaultIconCache } from './clustering/iconCache';
 import type {
   Camera,
@@ -79,6 +80,13 @@ type MarkerMeta = {
   /** Cached resolved image URI so we can prefetch without re-resolving. */
   imageUri?: string;
   fallback?: MarkerFallback;
+  /**
+   * True when the consumer passed React children (other than <Callout/>)
+   * to this <Marker>. Tracked per marker so that when a cluster shrinks
+   * to a single point, we can restore the ORIGINAL marker type — custom
+   * snapshot view if isCustom, native pin (pinColor/image) otherwise.
+   */
+  isCustom: boolean;
 };
 
 function childTypeName(child: React.ReactElement) {
@@ -190,6 +198,10 @@ function parseChildren(children: React.ReactNode) {
         title: props.title,
         imageUri: resolvedImageUri,
         fallback,
+        // A marker is "custom" when it carries React children other than
+        // a <Callout/>. Used by the cluster pipeline to restore the right
+        // marker type after a cluster collapses to a singleton.
+        isCustom: customChildren !== null,
       });
 
       if (markerRef) markerRefs.set(id, markerRef);
@@ -800,38 +812,68 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       const snaps: MarkerSnapshot[] = [];
       const byId = new Map<string, Cluster>();
 
+      // Lookup tables so singleton clusters can restore the ORIGINAL
+      // marker payload + snapshot (preserving its custom-vs-native type).
+      const markerById = new Map<string, NativeMarker>();
+      for (const m of parsed.markers) markerById.set(m.id, m);
+      const snapshotByMarkerId = new Map<string, MarkerSnapshot>();
+      for (const s of parsed.markerSnapshots) snapshotByMarkerId.set(s.id, s);
+      const isCustomById = new Map<string, boolean>();
+      for (const meta of parsed.markerMeta.values()) {
+        isCustomById.set(meta.id, meta.isCustom);
+      }
+
       // 1) ignored markers pass through verbatim, with their original
       //    native marker entry + any custom snapshot children.
       for (const m of parsed.markers) {
         if (passthroughIds.has(m.id)) out.push(m);
       }
 
-      // 2) cluster results become synthetic markers. We use the membership
-      //    signature (NOT the raw grid id) as the suffix, so a cluster that
-      //    keeps the same members across recomputes — even when it moves
-      //    between adjacent grid cells — retains the same native marker id.
-      //    This is the critical knob that lets the native side reuse its
-      //    cached BitmapDescriptor / UIImage instead of recreating the
-      //    marker (and showing a default pin for a frame).
+      // 2) cluster results.
+      //
+      //    Singletons restore the ORIGINAL marker (native pin or custom
+      //    snapshot per the marker's children prop); multi-clusters get
+      //    a synthetic cluster marker rendered via renderCluster.
+      //    See {@link resolveCluster} for the pure decision logic.
       for (const c of clusters) {
-        const stableId = stableClusterKey(c);
-        const id = `${CLUSTER_MARKER_PREFIX}${stableId}`;
-        byId.set(id, c);
-        out.push({
-          id,
-          latitude: c.coordinate.latitude,
-          longitude: c.coordinate.longitude,
-          tappable: true,
-          tracksViewChanges: true,
-          anchor: { x: 0.5, y: 0.5 },
-        } as NativeMarker);
-        const node = renderClusterFn
-          ? renderClusterFn(c)
-          : <DefaultClusterBubble cluster={c} />;
-        snaps.push({ id, children: node });
+        const resolved = resolveCluster<NativeMarker, MarkerSnapshot>({
+          cluster: c,
+          markerById,
+          snapshotByMarkerId,
+          isCustomById,
+          makeClusterMarker: cluster => {
+            const stableId = stableClusterKey(cluster);
+            return {
+              id: `${CLUSTER_MARKER_PREFIX}${stableId}`,
+              latitude: cluster.coordinate.latitude,
+              longitude: cluster.coordinate.longitude,
+              tappable: true,
+              tracksViewChanges: true,
+              anchor: { x: 0.5, y: 0.5 },
+            } as NativeMarker;
+          },
+          makeClusterSnapshot: (cluster, syntheticId) => {
+            const node = renderClusterFn
+              ? renderClusterFn(cluster as Cluster)
+              : <DefaultClusterBubble cluster={cluster as Cluster} />;
+            return { id: syntheticId, children: node };
+          },
+        });
+        if (!resolved) continue;
+        out.push(resolved.marker);
+        if (resolved.snapshot) snaps.push(resolved.snapshot);
+        if (resolved.isCluster) byId.set(resolved.marker.id, c);
       }
       return { nativeMarkers: out, clusterSnapshots: snaps, clusterById: byId };
-    }, [clusteringEnabled, clusters, parsed.markers, passthroughIds, renderClusterFn]);
+    }, [
+      clusteringEnabled,
+      clusters,
+      parsed.markers,
+      parsed.markerSnapshots,
+      parsed.markerMeta,
+      passthroughIds,
+      renderClusterFn,
+    ]);
 
     // Combine "real" snapshots (only those that survive passthrough) with cluster snapshots.
     const allSnapshots = useMemo(() => {

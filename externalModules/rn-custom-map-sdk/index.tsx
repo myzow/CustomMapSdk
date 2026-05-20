@@ -18,6 +18,7 @@ export {
   stableClusterKey,
   diffMembership,
 } from './src/clustering/membership';
+export { resolveCluster } from './src/clustering/markerType';
 export * from './src/types';
 export { MAP_TYPES, PROVIDERS } from './src/constants';
 export { default } from './src/MapView';
