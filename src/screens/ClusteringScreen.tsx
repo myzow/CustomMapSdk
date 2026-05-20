@@ -1,12 +1,5 @@
 import React, { useMemo, useRef } from 'react';
-import {
-  Alert,
-  Image,
-  Platform,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { Alert, Image, Platform, StyleSheet, Text, View } from 'react-native';
 import MapView, {
   Marker,
   useMapTabLifecycle,
@@ -110,8 +103,9 @@ function ClusterBubble({ cluster }: { cluster: Cluster }) {
                 {
                   left: idx * 14,
                   zIndex: previews.length - idx,
-                  borderColor:
-                    place ? CATEGORY_COLORS[place.category] : '#1f6feb',
+                  borderColor: place
+                    ? CATEGORY_COLORS[place.category]
+                    : '#1f6feb',
                 },
               ]}
             />
@@ -183,7 +177,23 @@ export default function ClusteringScreen() {
             // The line that powers everything: arbitrary payload that
             // travels with the marker into Cluster.markers[i].data.
             data={place}
-          />
+          >
+            <View
+              style={{
+                borderColor: 'white',
+                borderWidth: 1,
+                borderRadius: 10,
+                width: 50,
+                height: 50,
+                padding: 3,
+              }}
+            >
+              <Image
+                source={{ uri: place.avatar }}
+                style={{ width: '100%', height: '100%', borderRadius: 10 }}
+              />
+            </View>
+          </Marker>
         ))}
       </MapView>
 
@@ -205,7 +215,7 @@ const styles = StyleSheet.create({
   singleton: {
     width: 38,
     height: 38,
-    borderRadius: 19,
+    borderRadius: 8,
     borderWidth: 2,
     backgroundColor: '#0d1117',
     padding: 1.5,
@@ -214,7 +224,7 @@ const styles = StyleSheet.create({
   singletonFallback: {
     width: 30,
     height: 30,
-    borderRadius: 15,
+    borderRadius: 8,
     backgroundColor: '#1f6feb',
     borderWidth: 2,
     borderColor: '#ffffff',
@@ -231,7 +241,7 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     paddingHorizontal: 6,
     paddingRight: 30,
-    borderRadius: 24,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: '#30363d',
   },
@@ -243,7 +253,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     width: 28,
     height: 28,
-    borderRadius: 14,
+    borderRadius: 8,
     borderWidth: 2,
     backgroundColor: '#1f242b',
   },

@@ -32,7 +32,11 @@ export type RegionChangeDetails = {
 export type MarkerAnimationOptions = {
   duration?: number;
   easing?: 'linear' | 'easeIn' | 'easeOut' | 'easeInOut';
-  interpolator?: 'linear' | 'accelerate' | 'decelerate' | 'accelerateDecelerate';
+  interpolator?:
+    | 'linear'
+    | 'accelerate'
+    | 'decelerate'
+    | 'accelerateDecelerate';
 };
 
 export type FitToElementsOptions = {
@@ -87,7 +91,10 @@ export interface MapViewProps extends Omit<ViewProps, 'children'> {
   onPress?: (event: { coordinate: Coordinate }) => void;
   onLongPress?: (event: { coordinate: Coordinate }) => void;
   onRegionChange?: (region: Region, details?: RegionChangeDetails) => void;
-  onRegionChangeComplete?: (region: Region, details?: RegionChangeDetails) => void;
+  onRegionChangeComplete?: (
+    region: Region,
+    details?: RegionChangeDetails,
+  ) => void;
   onMapReady?: () => void;
   onUserLocationChange?: (event: { coordinate: Coordinate }) => void;
 }
@@ -265,17 +272,25 @@ export interface CircleProps {
   zIndex?: number;
 }
 
+export interface CameraOptions {
+  duration?: number;
+  // easing?: 'linear' | 'easeIn' | 'easeOut' | 'easeInOut';
+}
+
 export interface MapViewMethods {
-  animateToRegion(region: Region, duration?: number): void;
+  animateToRegion(region: Region, options?: CameraOptions): void;
   animateToCoordinate(coordinate: Coordinate, duration?: number): void;
   fitToCoordinates(
     coordinates: Coordinate[],
     options?: number | FitToElementsOptions,
   ): void;
   fitToElements(options?: number | FitToElementsOptions): void;
-  fitToSuppliedMarkers(markers: string[], options?: number | FitToSuppliedMarkersOptions): void;
+  fitToSuppliedMarkers(
+    markers: string[],
+    options?: number | FitToSuppliedMarkersOptions,
+  ): void;
   getCamera(): Promise<Camera>;
-  setCamera(camera: Camera, duration?: number): void;
+  setCamera(camera: Camera, options?: CameraOptions): void;
   getMarkers(): Promise<MarkerResponse[]>;
   /**
    * Bring the embedded Android MapView to RESUMED / PAUSED state.
