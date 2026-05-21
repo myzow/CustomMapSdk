@@ -83,6 +83,20 @@ export interface MapViewProps extends Omit<ViewProps, 'children'> {
   minZoomLevel?: number;
   maxZoomLevel?: number;
   /**
+   * Google Maps Cloud-based styling / Advanced Markers `mapId`.
+   *
+   * <p>REQUIRED for `<AdvancedMarker>` to render — Google's Advanced Markers
+   * APIs only activate on a map created with a valid `mapId`. The SDK ships
+   * with the special development value `"DEMO_MAP_ID"` so apps can experiment
+   * without provisioning a real ID; production builds should set their own.
+   *
+   * <p>Has NO effect on classic `<Marker>`. Changing the value at runtime
+   * is supported but may force the native map to recreate its GL surface.
+   *
+   * <p>Default: `"DEMO_MAP_ID"`.
+   */
+  mapId?: string;
+  /**
    * Enables marker clustering. When `enabled` is true (default if the object
    * is present), markers are grouped on every camera idle. See
    * {@link ClusterConfig}.
@@ -353,4 +367,113 @@ export type NativeCircle = {
   strokeWidth?: number;
   fillColor?: string;
   zIndex?: number;
+};
+
+// ============================================================================
+// AdvancedMarker
+// ============================================================================
+
+/**
+ * Props accepted by the new `<AdvancedMarker>` component. Mirrors the subset
+ * of fields supported by Google Maps Advanced Markers (Android Maps SDK
+ * `AdvancedMarkerOptions` and iOS `GMSAdvancedMarker`).
+ *
+ * Two modes:
+ *   - With `children`  → custom marker; children are attached as the native
+ *                        iconView so React Native views (Image, Lottie, etc.)
+ *                        render directly without a bitmap snapshot.
+ *   - Without children → default Google Maps pin, optionally colored via
+ *                        `pinColor`.
+ */
+export interface AdvancedMarkerProps {
+  /** Marker position. */
+  coordinate: Coordinate;
+  /** Unique id used for clustering, refs, and event routing. Required. */
+  identifier: string;
+  /** Info-window title shown on tap. */
+  title?: string;
+  /** Info-window description shown on tap. */
+  description?: string;
+  /** Pin color for the default (no-children) advanced marker. */
+  pinColor?: string;
+  /** Whether the marker can be dragged by the user. */
+  draggable?: boolean;
+  /** When true, the marker is drawn flat against the map plane. */
+  flat?: boolean;
+  /** Rotation in degrees (clockwise around the anchor). */
+  rotation?: number;
+  /** Opacity (0-1). */
+  opacity?: number;
+  /** Anchor point on the marker image — (0.5, 1) is the bottom-center. */
+  anchor?: Point;
+  /** Z-axis stacking order against other markers. */
+  zIndex?: number;
+  /**
+   * Arbitrary payload carried with the marker. Surfaced on every cluster
+   * member as `cluster.markers[i].data` — same convention used by `<Marker>`.
+   * Stored in JS only; never bridged.
+   */
+  data?: any;
+  /**
+   * React children for custom marker content. When supplied, the marker
+   * renders this tree as the native iconView. When absent, the marker
+   * shows the standard Google Maps pin (honoring `pinColor`).
+   */
+  children?: React.ReactNode;
+  /** Fired when the marker (or singleton cluster wrapping it) is tapped. */
+  onPress?: (event?: { coordinate: Coordinate }) => void;
+  /** Fired when this advanced marker becomes selected. */
+  onSelect?: (event?: { coordinate: Coordinate }) => void;
+  /** Fired when this advanced marker loses selection. */
+  onDeselect?: (event?: { coordinate: Coordinate }) => void;
+  /** Fired when a drag gesture begins. Only relevant when `draggable` is true. */
+  onDragStart?: (event: { coordinate: Coordinate }) => void;
+  /** Fired continuously during a drag. */
+  onDrag?: (event: { coordinate: Coordinate }) => void;
+  /** Fired when the drag gesture completes. */
+  onDragEnd?: (event: { coordinate: Coordinate }) => void;
+}
+
+/**
+ * Imperative methods exposed on an `<AdvancedMarker>` ref. Currently mirrors
+ * the basic `<Marker>` API for parity — the advanced marker pipeline routes
+ * the same calls through its dedicated native path.
+ */
+export interface AdvancedMarkerMethods {
+  showCallout(): void;
+  hideCallout(): void;
+  redraw(): void;
+}
+
+/**
+ * The shape of the entry pushed across the bridge for each AdvancedMarker.
+ * Separated from {@link NativeMarker} so the native side can pick the
+ * correct primitive (AdvancedMarkerOptions / GMSAdvancedMarker) without
+ * inspecting props on a unified payload.
+ */
+export type NativeAdvancedMarker = {
+  id: string;
+  latitude: number;
+  longitude: number;
+  title?: string;
+  description?: string;
+  pinColor?: string;
+  draggable?: boolean;
+  flat?: boolean;
+  rotation?: number;
+  opacity?: number;
+  anchor?: Point;
+  zIndex?: number;
+  /**
+   * True when the original `<AdvancedMarker>` carried children. The native
+   * side uses this hint to expect a follow-up `setAdvancedMarkerView` call
+   * for this id, and to suppress the default pin in the meantime.
+   */
+  hasCustomView?: boolean;
+  /**
+   * True when this entry was synthesized by the cluster pipeline (i.e. a
+   * multi-member cluster bubble). The native side keeps these out of the
+   * cluster manager itself.
+   */
+  isCluster?: boolean;
 };

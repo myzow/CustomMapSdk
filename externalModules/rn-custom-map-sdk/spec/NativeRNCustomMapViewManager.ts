@@ -72,6 +72,14 @@ export interface Spec extends TurboModule {
     options?: MarkerAnimationOptions,
   ): void;
   setMarkerView(reactTag: Int32, markerId: string, markerViewTag: Int32): void;
+  /**
+   * Attaches a React-rendered view tag as the native `iconView` of an
+   * AdvancedMarker. Mirrors {@link setMarkerView} but is routed through the
+   * dedicated advanced-marker pipeline so the children render as actual
+   * native subviews (Android `AdvancedMarkerOptions.iconView` / iOS
+   * `GMSAdvancedMarker.iconView`) rather than rasterized bitmaps.
+   */
+  setAdvancedMarkerView(reactTag: Int32, markerId: string, markerViewTag: Int32): void;
 
   // ---- Lifecycle (Issue 2 fix) ----
   // setActive(true) brings the embedded native MapView back to RESUMED state

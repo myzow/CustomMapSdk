@@ -1,5 +1,6 @@
 export { default as MapView } from './src/MapView';
 export { default as Marker } from './src/Marker';
+export { default as AdvancedMarker } from './src/AdvancedMarker';
 export { default as Callout } from './src/Callout';
 export { default as Polyline } from './src/Polyline';
 export { default as Circle } from './src/Circle';

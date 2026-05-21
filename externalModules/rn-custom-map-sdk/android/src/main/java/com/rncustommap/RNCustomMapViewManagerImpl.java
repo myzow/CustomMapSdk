@@ -139,12 +139,6 @@ public final class RNCustomMapViewManagerImpl {
     view.whenReady(() -> {
       // ----------------------------------------------------------------
       // Diff-based update — the original implementation removed ALL
-      // markers then re-created them, which was the root cause of the
-      // perceptible flicker during pan/zoom/cluster transitions. Each
-      // freshly-created Marker shows the default red pin for a few frames
-      // until its bitmap is decoded. We now reuse the existing Marker
-      // when the id is unchanged and only mutate the fields that differ.
-      // ----------------------------------------------------------------
       MarkerIconCache cache = MarkerIconCache.get(view.getContext());
 
       Map<String, ReadableMap> incoming = new HashMap<>();
@@ -334,6 +328,30 @@ public final class RNCustomMapViewManagerImpl {
       if (url == null || url.isEmpty()) continue;
       cache.prefetch(view.getContext(), url);
     }
+  }
+
+  /**
+   * Replace the advanced-marker set on the host view. Delegates to
+   * {@link RNAdvancedMarkers#setAdvancedMarkers}, which decides between the
+   * cluster-manager path and the direct-add path based on the host's
+   * `advancedClusteringEnabled` flag.
+   */
+  static void setAdvancedMarkers(RNCustomMapView view, @Nullable ReadableArray advancedMarkers) {
+    if (view.googleMap == null) {
+      // Defer until onMapReady.
+      view.pendingAdvancedMarkers = advancedMarkers;
+      return;
+    }
+    RNAdvancedMarkers.setAdvancedMarkers(view, advancedMarkers, view.advancedClusteringEnabled);
+  }
+
+  /**
+   * Apply a new mapId. The Maps SDK doesn't permit changing the mapId after
+   * MapView construction — this method records the value and emits a warning
+   * if it differs from the one used at construction time.
+   */
+  static void setMapId(RNCustomMapView view, @Nullable String mapId) {
+    view.applyMapId(mapId);
   }
 
   /** Clears the entire native icon cache. Used by clearMarkerIconCache. */

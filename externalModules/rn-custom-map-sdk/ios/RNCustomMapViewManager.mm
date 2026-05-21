@@ -33,8 +33,14 @@ RCT_EXPORT_VIEW_PROPERTY(onMarkerDragEnd, RCTBubblingEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onCalloutPress, RCTBubblingEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(onPolylinePress, RCTBubblingEventBlock)
 RCT_EXPORT_VIEW_PROPERTY(markers, NSArray)
+RCT_EXPORT_VIEW_PROPERTY(advancedMarkers, NSArray)
 RCT_EXPORT_VIEW_PROPERTY(polylines, NSArray)
 RCT_EXPORT_VIEW_PROPERTY(circles, NSArray)
+
+RCT_CUSTOM_VIEW_PROPERTY(mapId, NSString, RNCustomMapNativeView)
+{
+  [view setMapId:json ?: @"DEMO_MAP_ID"];
+}
 
 RCT_CUSTOM_VIEW_PROPERTY(region, NSDictionary, RNCustomMapNativeView)
 {

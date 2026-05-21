@@ -58,6 +58,23 @@ type NativeMarker = Readonly<{
   calloutTooltip?: WithDefault<boolean, false>;
 }>;
 
+type NativeAdvancedMarker = Readonly<{
+  id: string;
+  latitude: Double;
+  longitude: Double;
+  title?: WithDefault<string, ''>;
+  description?: WithDefault<string, ''>;
+  pinColor?: WithDefault<string, ''>;
+  anchor?: Point;
+  draggable?: WithDefault<boolean, false>;
+  flat?: WithDefault<boolean, false>;
+  rotation?: WithDefault<Float, 0>;
+  opacity?: WithDefault<Float, 1>;
+  zIndex?: WithDefault<Int32, 0>;
+  hasCustomView?: WithDefault<boolean, false>;
+  isCluster?: WithDefault<boolean, false>;
+}>;
+
 type NativePolyline = Readonly<{
   id: string;
   coordinates: ReadonlyArray<Coordinate>;
@@ -131,7 +148,9 @@ export interface NativeProps extends ViewProps {
   pitchEnabled?: WithDefault<boolean, true>;
   minZoomLevel?: Float;
   maxZoomLevel?: Float;
+  mapId?: WithDefault<string, 'DEMO_MAP_ID'>;
   markers?: ReadonlyArray<NativeMarker>;
+  advancedMarkers?: ReadonlyArray<NativeAdvancedMarker>;
   polylines?: ReadonlyArray<NativePolyline>;
   circles?: ReadonlyArray<NativeCircle>;
   onPress?: BubblingEventHandler<CoordinateEvent>;

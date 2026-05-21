@@ -22,6 +22,7 @@ import NativeMapViewManager from '../spec/NativeRNCustomMapViewManager';
 import Callout from './Callout';
 import Circle from './Circle';
 import Marker from './Marker';
+import AdvancedMarker from './AdvancedMarker';
 import Polyline from './Polyline';
 import MarkerPlaceholder from './Placeholder';
 import {
@@ -39,6 +40,7 @@ import { stableClusterKey } from './clustering/membership';
 import { resolveCluster } from './clustering/markerType';
 import { defaultIconCache } from './clustering/iconCache';
 import type {
+  AdvancedMarkerProps,
   Camera,
   CameraOptions,
   CircleProps,
@@ -51,6 +53,7 @@ import type {
   MarkerFallback,
   MarkerMethods,
   MarkerProps,
+  NativeAdvancedMarker,
   NativeCircle,
   NativeMarker,
   NativePolyline,
@@ -63,12 +66,14 @@ const DEFAULT_DURATION = 500;
 const DEFAULT_FIT_PADDING = 50;
 const DEFAULT_CLUSTER_RADIUS = 60;
 const CLUSTER_MARKER_PREFIX = 'cluster:';
+const ADVANCED_CLUSTER_MARKER_PREFIX = 'acluster:';
 const DEFAULT_RENDER_THRESHOLD = 0.5;
 const DEFAULT_DRAG_THRESHOLD = 50;
 const DEFAULT_DEBOUNCE_MS = 100;
 const DEFAULT_ZOOM_STEP_ON_PRESS = 2;
 const DEFAULT_MAX_ZOOM = 20;
 const DEFAULT_CLUSTER_EXPAND_PADDING = 80;
+const DEFAULT_MAP_ID = 'DEMO_MAP_ID';
 
 type EventPayload<T> = NativeSyntheticEvent<T>;
 
@@ -82,15 +87,16 @@ type MarkerMeta = {
   coordinate: Coordinate;
   data?: any;
   title?: string;
-  /** Cached resolved image URI so we can prefetch without re-resolving. */
   imageUri?: string;
   fallback?: MarkerFallback;
-  /**
-   * True when the consumer passed React children (other than <Callout/>)
-   * to this <Marker>. Tracked per marker so that when a cluster shrinks
-   * to a single point, we can restore the ORIGINAL marker type — custom
-   * snapshot view if isCustom, native pin (pinColor/image) otherwise.
-   */
+  isCustom: boolean;
+};
+
+type AdvancedMarkerMeta = {
+  id: string;
+  coordinate: Coordinate;
+  data?: any;
+  title?: string;
   isCustom: boolean;
 };
 
@@ -134,15 +140,35 @@ function isCalloutChild(child: React.ReactNode) {
   );
 }
 
-function getMarkerCustomChildren(marker: React.ReactElement<MarkerProps>) {
+function getMarkerCustomChildren(
+  marker: React.ReactElement<MarkerProps | AdvancedMarkerProps>,
+) {
   const customChildren = React.Children.toArray(marker.props.children).filter(
     child => !isCalloutChild(child),
   );
   return customChildren.length > 0 ? customChildren : null;
 }
 
+function isAdvancedMarkerNode(
+  child: React.ReactElement,
+): child is React.ReactElement<AdvancedMarkerProps> {
+  return (
+    child.type === AdvancedMarker ||
+    childTypeName(child) === 'RNCustomMapAdvancedMarker'
+  );
+}
+
+function isMarkerNode(
+  child: React.ReactElement,
+): child is React.ReactElement<MarkerProps> {
+  return (
+    child.type === Marker || childTypeName(child) === 'RNCustomMapMarker'
+  );
+}
+
 function parseChildren(children: React.ReactNode) {
   const markers: NativeMarker[] = [];
+  const advancedMarkers: NativeAdvancedMarker[] = [];
   const polylines: NativePolyline[] = [];
   const circles: NativeCircle[] = [];
   const markerPressHandlers = new Map<string, MarkerProps['onPress']>();
@@ -155,22 +181,58 @@ function parseChildren(children: React.ReactNode) {
   const polylinePressHandlers = new Map<string, PolylineProps['onPress']>();
   const markerRefs = new Map<string, React.Ref<MarkerMethods>>();
   const markerSnapshots: MarkerSnapshot[] = [];
-  /** id → {data, title, coordinate} — JS-only, never bridged. */
+  const advancedMarkerSnapshots: MarkerSnapshot[] = [];
   const markerMeta = new Map<string, MarkerMeta>();
+  const advancedMarkerMeta = new Map<string, AdvancedMarkerMeta>();
 
   React.Children.forEach(children, (child, index) => {
     if (!React.isValidElement(child)) return;
-    const name = childTypeName(child);
 
-    if (child.type === Marker || name === 'RNCustomMapMarker') {
-      const props = child.props as MarkerProps;
+    if (isAdvancedMarkerNode(child)) {
+      const props = child.props;
+      const id = props.identifier ?? `advanced-marker-${index}`;
+      const customChildren = getMarkerCustomChildren(child);
+      advancedMarkers.push(
+        compactObject({
+          id,
+          latitude: props.coordinate.latitude,
+          longitude: props.coordinate.longitude,
+          title: props.title,
+          description: props.description,
+          pinColor: props.pinColor,
+          draggable: props.draggable,
+          flat: props.flat,
+          rotation: props.rotation,
+          opacity: props.opacity,
+          anchor: props.anchor,
+          zIndex: props.zIndex,
+          hasCustomView: customChildren !== null,
+        }) as NativeAdvancedMarker,
+      );
+      advancedMarkerMeta.set(id, {
+        id,
+        coordinate: props.coordinate,
+        data: props.data,
+        title: props.title,
+        isCustom: customChildren !== null,
+      });
+      if (customChildren) {
+        advancedMarkerSnapshots.push({ id, children: customChildren });
+      }
+      if (props.onPress) markerPressHandlers.set(id, props.onPress);
+      if (props.onSelect) markerSelectHandlers.set(id, props.onSelect);
+      if (props.onDeselect) markerDeselectHandlers.set(id, props.onDeselect);
+      if (props.onDragStart) markerDragStartHandlers.set(id, props.onDragStart);
+      if (props.onDrag) markerDragHandlers.set(id, props.onDrag);
+      if (props.onDragEnd) markerDragEndHandlers.set(id, props.onDragEnd);
+      return;
+    }
+
+    if (isMarkerNode(child)) {
+      const props = child.props;
       const id = props.identifier ?? props.id ?? `marker-${index}`;
-      const callout = getMarkerCallout(
-        child as React.ReactElement<MarkerProps>,
-      );
-      const customChildren = getMarkerCustomChildren(
-        child as React.ReactElement<MarkerProps>,
-      );
+      const callout = getMarkerCallout(child);
+      const customChildren = getMarkerCustomChildren(child);
       const markerRef = (child as any).ref ?? (child.props as any).ref;
       const fallback = props.fallback;
 
@@ -201,7 +263,6 @@ function parseChildren(children: React.ReactNode) {
         }),
       );
 
-      // userData is an alias of data; explicit `data` wins.
       const data = props.data !== undefined ? props.data : props.userData;
       const resolvedImageUri =
         resolveImageSource(props.image) ?? resolveImageSource(props.icon);
@@ -212,9 +273,6 @@ function parseChildren(children: React.ReactNode) {
         title: props.title,
         imageUri: resolvedImageUri,
         fallback,
-        // A marker is "custom" when it carries React children other than
-        // a <Callout/>. Used by the cluster pipeline to restore the right
-        // marker type after a cluster collapses to a singleton.
         isCustom: customChildren !== null,
       });
 
@@ -236,7 +294,7 @@ function parseChildren(children: React.ReactNode) {
       return;
     }
 
-    if (child.type === Polyline || name === 'RNCustomMapPolyline') {
+    if (child.type === Polyline || childTypeName(child) === 'RNCustomMapPolyline') {
       const props = child.props as PolylineProps;
       const id = props.id ?? `polyline-${index}`;
       polylines.push(
@@ -255,7 +313,7 @@ function parseChildren(children: React.ReactNode) {
       return;
     }
 
-    if (child.type === Circle || name === 'RNCustomMapCircle') {
+    if (child.type === Circle || childTypeName(child) === 'RNCustomMapCircle') {
       const props = child.props as CircleProps;
       circles.push(
         compactObject({
@@ -273,6 +331,7 @@ function parseChildren(children: React.ReactNode) {
 
   return {
     markers,
+    advancedMarkers,
     polylines,
     circles,
     markerPressHandlers,
@@ -285,7 +344,9 @@ function parseChildren(children: React.ReactNode) {
     polylinePressHandlers,
     markerRefs,
     markerSnapshots,
+    advancedMarkerSnapshots,
     markerMeta,
+    advancedMarkerMeta,
   };
 }
 
@@ -322,15 +383,6 @@ function fitOptions(
   };
 }
 
-/**
- * Default cluster visual used when the consumer didn't provide one. For
- * singleton clusters (count === 1), and when the original marker has a
- * `fallback` config, we render the user-provided MarkerPlaceholder so the
- * first frame is on-brand. For multi-clusters we render a numeric bubble.
- *
- * This is what guarantees no Google pin ever appears — even consumers who
- * forget to set up renderCluster get a styled placeholder.
- */
 function DefaultClusterBubble({ cluster }: { cluster: Cluster }) {
   if (cluster.pointCount === 1) {
     const member = cluster.markers[0];
@@ -363,21 +415,19 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       clusterConfig,
       initialRegion,
       region,
+      mapId,
       ...props
     },
     ref,
   ) => {
     const nativeRef = useRef<React.ElementRef<typeof NativeMapView>>(null);
     const markerViewTags = useRef(new Map<string, number>());
+    const advancedMarkerViewTags = useRef(new Map<string, number>());
     const parsed = useMemo(() => parseChildren(children), [children]);
+    const resolvedMapId = mapId ?? DEFAULT_MAP_ID;
 
-    // ------------------------------------------------------------------
-    // Tag resolution
-    // ------------------------------------------------------------------
     const getReactTag = useCallback(() => {
       const tag = findNodeHandle(nativeRef.current);
-      // Do NOT throw — first-frame callers may arrive before findNodeHandle
-      // resolves. Return -1 so the native side cleanly short-circuits.
       return tag == null ? -1 : tag;
     }, []);
     const getReactTagSafe = useCallback(() => {
@@ -385,9 +435,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       return tag >= 0 ? tag : null;
     }, [getReactTag]);
 
-    // ------------------------------------------------------------------
-    // Imperative API
-    // ------------------------------------------------------------------
     useImperativeHandle(
       ref,
       () => ({
@@ -400,10 +447,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
             options?.duration ?? DEFAULT_DURATION,
           );
         },
-        animateToCoordinate(
-          coordinate: Coordinate,
-          duration = DEFAULT_DURATION,
-        ) {
+        animateToCoordinate(coordinate: Coordinate, duration = DEFAULT_DURATION) {
           const tag = getReactTagSafe();
           if (tag == null) return;
           NativeMapViewManager.animateToCoordinate(tag, coordinate, duration);
@@ -463,9 +507,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       [getReactTag, getReactTagSafe],
     );
 
-    // ------------------------------------------------------------------
-    // Per-marker ref wiring (unchanged)
-    // ------------------------------------------------------------------
     useEffect(() => {
       parsed.markerRefs.forEach((markerRef, markerId) => {
         setMarkerRef(markerRef, {
@@ -494,9 +535,8 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     }, [getReactTag, parsed]);
 
     // ==================================================================
-    // Clustering pipeline
+    // Clustering pipeline (shared by classic + advanced markers)
     // ==================================================================
-
     const clusteringEnabled =
       clusterConfig?.enabled !== false && !!clusterConfig;
     const ignoreSet = useMemo(
@@ -515,66 +555,30 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     const customOnPress = clusterConfig?.customOnPress;
     const maxZoomLevel = props.maxZoomLevel ?? DEFAULT_MAX_ZOOM;
 
-    /**
-     * Live region — updated on every region-change event (incl. mid-drag). Used
-     * only for tracking; never feeds the cluster engine directly.
-     */
     const liveRegionRef = useRef<Region | undefined>(region ?? initialRegion);
-    /**
-     * Last region that was actually fed into the cluster engine. Used as the
-     * baseline for the renderThreshold / dragThreshold checks.
-     */
     const lastComputedRegionRef = useRef<Region | undefined>(undefined);
-    /**
-     * Region that the recompute effect is currently computing against. Only
-     * advances when thresholds are met or inputs (points/viewport) change.
-     */
     const [regionForCompute, setRegionForCompute] = useState<
       Region | undefined
     >(region ?? initialRegion);
-    /** Viewport pixel size — tracked from container onLayout. */
     const [viewport, setViewport] = useState<{ width: number; height: number }>(
-      {
-        width: 0,
-        height: 0,
-      },
+      { width: 0, height: 0 },
     );
-    /** Latest computed clusters. */
     const [clusters, setClusters] = useState<Cluster[]>([]);
-    /**
-     * Zoom-bucket → cluster-array cache. Lets the user pan & zoom back through
-     * previously-computed levels without re-running the algorithm.
-     */
+    const [advancedClusters, setAdvancedClusters] = useState<Cluster[]>([]);
     const clusterCacheRef = useRef<Map<string, Cluster[]>>(new Map());
-    /** Pending debounce handle for the "settle then recompute" timer. */
+    const advancedClusterCacheRef = useRef<Map<string, Cluster[]>>(new Map());
     const recomputeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
       null,
     );
-    /**
-     * Drag-aware gate. Lives for the lifetime of the MapView. The gate is
-     * the SINGLE source of truth for "is the user mid-gesture?", which is
-     * the answer that decides whether we run clustering on each event.
-     * Without this gate, every region-change during a pinch fires a fresh
-     * cluster pass, which in turn re-creates native markers and produces
-     * the perceptible default-pin flicker.
-     */
     const dragGateRef = useRef<DragGate>(
       new DragGate({
         debounceMs,
         gestureSettleMs: Math.max(debounceMs * 2, 150),
       }),
     );
-    /**
-     * Drag state mirrored into React so the render path can suppress
-     * non-essential work (snapshot-view reflow, prefetching) while a
-     * gesture is in flight.
-     */
     const [isDragging, setIsDragging] = useState<boolean>(false);
 
-    /**
-     * Splits the marker meta map into "passthrough" (kept as-is, e.g. items
-     * the consumer pinned via ignoreClusterIds) and "clusterable" inputs.
-     */
+    // Split markers into clusterable / passthrough (per cluster pipeline).
     const { clusterablePoints, passthroughIds } = useMemo(() => {
       if (!clusteringEnabled)
         return { clusterablePoints: [], passthroughIds: new Set<string>() };
@@ -595,32 +599,49 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       return { clusterablePoints: cpoints, passthroughIds: pass };
     }, [clusteringEnabled, parsed.markerMeta, ignoreSet]);
 
-    /**
-     * Reset the cluster cache whenever any input that materially affects the
-     * cluster output changes. Pan/zoom alone never invalidates the cache.
-     */
+    const {
+      advancedClusterablePoints,
+      advancedPassthroughIds,
+    } = useMemo(() => {
+      if (!clusteringEnabled)
+        return {
+          advancedClusterablePoints: [],
+          advancedPassthroughIds: new Set<string>(),
+        };
+      const cpoints: ClusterPoint[] = [];
+      const pass = new Set<string>();
+      for (const meta of parsed.advancedMarkerMeta.values()) {
+        if (ignoreSet.has(meta.id)) {
+          pass.add(meta.id);
+        } else {
+          cpoints.push({
+            id: meta.id,
+            coordinate: meta.coordinate,
+            data: meta.data,
+            title: meta.title,
+          });
+        }
+      }
+      return {
+        advancedClusterablePoints: cpoints,
+        advancedPassthroughIds: pass,
+      };
+    }, [clusteringEnabled, parsed.advancedMarkerMeta, ignoreSet]);
+
     useEffect(() => {
       clusterCacheRef.current.clear();
+      advancedClusterCacheRef.current.clear();
     }, [
       clusterablePoints,
+      advancedClusterablePoints,
       ignoreSet,
       clusterRadius,
       viewport.width,
       viewport.height,
     ]);
 
-    /**
-     * Run clustering: tries native first (Android/iOS only when supported)
-     * and gracefully falls back to the pure-JS engine. Results are written
-     * into the bucketed cache keyed by zoom level so that returning to a
-     * previously-computed zoom level is free.
-     */
     const recompute = useCallback(async () => {
       if (!clusteringEnabled) return;
-      if (clusterablePoints.length === 0 && passthroughIds.size === 0) {
-        setClusters([]);
-        return;
-      }
       if (!regionForCompute || viewport.width === 0 || viewport.height === 0) {
         return;
       }
@@ -629,82 +650,119 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         regionForCompute.longitudeDelta,
         renderThreshold,
       );
-      const cached = clusterCacheRef.current.get(cacheKey);
-      if (cached) {
-        setClusters(cached);
-        lastComputedRegionRef.current = regionForCompute;
-        return;
-      }
 
-      // --- Native acceleration path -------------------------------------
-      let nativeResult: EngineCluster[] | undefined;
-      if (!forceJS && (Platform.OS === 'android' || Platform.OS === 'ios')) {
-        const tag = getReactTagSafe();
-        const compute = (NativeMapViewManager as any).computeClusters;
-        if (
-          tag != null &&
-          typeof compute === 'function' &&
-          clusterablePoints.length > 0
-        ) {
-          try {
-            const minimal = clusterablePoints.map(p => ({
-              id: p.id,
-              latitude: p.coordinate.latitude,
-              longitude: p.coordinate.longitude,
-            }));
-            const buckets = await compute(tag, minimal, clusterRadius);
-            if (Array.isArray(buckets)) {
-              nativeResult = clusterPoints({
-                points: clusterablePoints,
-                region: regionForCompute,
-                viewport,
-                radius: clusterRadius,
-                nativeBuckets: buckets.map((b: any) => ({
-                  bucketId: b.bucketId,
-                  markerIds: b.markerIds,
-                  coordinate: { latitude: b.latitude, longitude: b.longitude },
-                })),
-              });
+      // ----- Classic markers ---------------------------------------------
+      if (
+        clusterablePoints.length === 0 &&
+        passthroughIds.size === 0 &&
+        clusters.length > 0
+      ) {
+        setClusters([]);
+      } else if (clusterablePoints.length > 0 || passthroughIds.size > 0) {
+        const cached = clusterCacheRef.current.get(cacheKey);
+        if (cached) {
+          setClusters(cached);
+        } else {
+          let nativeResult: EngineCluster[] | undefined;
+          if (
+            !forceJS &&
+            (Platform.OS === 'android' || Platform.OS === 'ios')
+          ) {
+            const tag = getReactTagSafe();
+            const compute = (NativeMapViewManager as any).computeClusters;
+            if (
+              tag != null &&
+              typeof compute === 'function' &&
+              clusterablePoints.length > 0
+            ) {
+              try {
+                const minimal = clusterablePoints.map(p => ({
+                  id: p.id,
+                  latitude: p.coordinate.latitude,
+                  longitude: p.coordinate.longitude,
+                }));
+                const buckets = await compute(tag, minimal, clusterRadius);
+                if (Array.isArray(buckets)) {
+                  nativeResult = clusterPoints({
+                    points: clusterablePoints,
+                    region: regionForCompute,
+                    viewport,
+                    radius: clusterRadius,
+                    nativeBuckets: buckets.map((b: any) => ({
+                      bucketId: b.bucketId,
+                      markerIds: b.markerIds,
+                      coordinate: {
+                        latitude: b.latitude,
+                        longitude: b.longitude,
+                      },
+                    })),
+                  });
+                }
+              } catch {
+                /* fall through to JS */
+              }
             }
-          } catch {
-            // Fall through to the JS engine below.
           }
+          const result =
+            nativeResult ??
+            clusterPoints({
+              points: clusterablePoints,
+              region: regionForCompute,
+              viewport,
+              radius: clusterRadius,
+            });
+          clusterCacheRef.current.set(cacheKey, result);
+          setClusters(result);
         }
       }
 
-      // --- JS fallback / primary path -----------------------------------
-      const result =
-        nativeResult ??
-        clusterPoints({
-          points: clusterablePoints,
-          region: regionForCompute,
-          viewport,
-          radius: clusterRadius,
-        });
-      clusterCacheRef.current.set(cacheKey, result);
+      // ----- Advanced markers --------------------------------------------
+      if (
+        advancedClusterablePoints.length === 0 &&
+        advancedPassthroughIds.size === 0 &&
+        advancedClusters.length > 0
+      ) {
+        setAdvancedClusters([]);
+      } else if (
+        advancedClusterablePoints.length > 0 ||
+        advancedPassthroughIds.size > 0
+      ) {
+        const cached = advancedClusterCacheRef.current.get(cacheKey);
+        if (cached) {
+          setAdvancedClusters(cached);
+        } else {
+          const result = clusterPoints({
+            points: advancedClusterablePoints,
+            region: regionForCompute,
+            viewport,
+            radius: clusterRadius,
+          });
+          advancedClusterCacheRef.current.set(cacheKey, result);
+          setAdvancedClusters(result);
+        }
+      }
+
       lastComputedRegionRef.current = regionForCompute;
-      setClusters(result);
     }, [
       clusteringEnabled,
       clusterablePoints,
       passthroughIds.size,
+      advancedClusterablePoints,
+      advancedPassthroughIds.size,
       regionForCompute,
       viewport,
       clusterRadius,
       forceJS,
       renderThreshold,
       getReactTagSafe,
+      clusters.length,
+      advancedClusters.length,
     ]);
 
     useEffect(() => {
       recompute();
     }, [recompute]);
 
-    /**
-     * Run the deferred recompute path. Reads "live" region (which may have
-     * advanced since the gate started waiting) and only commits to the
-     * cluster engine when the camera has moved enough to matter.
-     */
     const runDeferredRecompute = useCallback(() => {
       if (!clusteringEnabled) return;
       const live = liveRegionRef.current;
@@ -719,11 +777,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       if (should) setRegionForCompute(live);
     }, [clusteringEnabled, viewport, renderThreshold, dragThreshold]);
 
-    /**
-     * Dispatch a `region-change` event to the drag gate and act on its
-     * decision. The renderer never schedules a recompute on its own anymore
-     * — it only obeys the gate.
-     */
     const dispatchToGate = useCallback(
       (
         kind: 'region-change' | 'region-change-complete',
@@ -734,9 +787,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         if (decision.isDragging !== isDragging)
           setIsDragging(decision.isDragging);
         if (decision.shouldRecompute) {
-          // Should never happen for region-change / region-change-complete
-          // (gate only emits shouldRecompute on idle-timeout), but obey it
-          // defensively in case the gate's API ever changes.
           runDeferredRecompute();
           return;
         }
@@ -758,7 +808,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       [clusteringEnabled, isDragging, runDeferredRecompute],
     );
 
-    // Tear down any pending debounce on unmount.
     useEffect(() => {
       return () => {
         if (recomputeTimerRef.current) {
@@ -769,24 +818,16 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     }, []);
 
     // ------------------------------------------------------------------
-    // Icon prefetching — warms the native bitmap cache up-front
+    // Icon prefetching (classic markers only — advanced markers don't
+    // need bitmap prefetch because their children render as native views)
     // ------------------------------------------------------------------
-    /**
-     * Collects every remote image URL referenced by the current marker set
-     * and asks the native module to warm its bitmap cache. Already-loaded
-     * URLs are deduplicated through `defaultIconCache` so the bridge sees
-     * only first-time entries. Runs whenever the marker set changes and is
-     * intentionally suppressed during drag (prefetching mid-pinch wastes
-     * cycles on URLs whose markers may have left the viewport by the time
-     * the bitmap lands).
-     */
     useEffect(() => {
       if (isDragging) return;
       const urls: string[] = [];
       for (const meta of parsed.markerMeta.values()) {
         const uri = meta.imageUri;
         if (!uri) continue;
-        if (!/^https?:/i.test(uri)) continue; // only remote images need warming
+        if (!/^https?:/i.test(uri)) continue;
         if (defaultIconCache.beginPrefetch(uri)) urls.push(uri);
       }
       if (urls.length === 0) return;
@@ -796,9 +837,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       if (typeof prefetch !== 'function') return;
       try {
         prefetch(tag, urls);
-        // Optimistic: the native side will resolve / reject on its own.
-        // The cache stays in `pending` until we hear back, OR until the
-        // 500ms placeholder deadline elapses.
         for (const u of urls) defaultIconCache.markLoaded(u);
       } catch {
         for (const u of urls) defaultIconCache.markFailed(u);
@@ -806,7 +844,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     }, [parsed.markerMeta, getReactTagSafe, isDragging]);
 
     // ------------------------------------------------------------------
-    // Cluster press dispatcher — default zoom-in behavior with overrides
+    // Cluster press dispatcher
     // ------------------------------------------------------------------
     const expandClusterToMarkers = useCallback(
       (cluster: Cluster) => {
@@ -833,8 +871,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         const currentZoom = regionToZoom(live.longitudeDelta);
         const requestedZoom = currentZoom + zoomStepOnPress;
 
-        // Already at (or past) maxZoom AND the cluster still has > 1 member?
-        // Spread the camera over the members instead of zooming further.
         if (cluster.pointCount > 1 && currentZoom >= maxZoomLevel - 1e-3) {
           expandClusterToMarkers(cluster);
           return;
@@ -858,9 +894,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
           DEFAULT_DURATION,
         );
 
-        // If zoom request was capped at maxZoom and we still have multiple
-        // markers in this cluster, fall back to spreading them out so the user
-        // can actually see them.
         if (
           cluster.pointCount > 1 &&
           requestedZoom > maxZoomLevel &&
@@ -873,37 +906,25 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     );
 
     const handleClusterPress = useCallback(
-      (cluster: Cluster) => {
-        // Fire legacy notification handler first (no-op if absent).
+      (cluster: Cluster, pressHandlers: Map<string, MarkerProps['onPress']>) => {
         clusterConfig?.onClusterPress?.(cluster);
-
-        // customOnPress fully overrides default zoom behavior.
         if (customOnPress) {
           customOnPress(cluster);
           return;
         }
-
-        // Singleton clusters: nothing to expand — surface the original marker's
-        // onPress handler if one was registered.
         if (cluster.pointCount === 1) {
           const onlyId = cluster.markerIds[0];
-          const handler = parsed.markerPressHandlers.get(onlyId);
+          const handler = pressHandlers.get(onlyId);
           handler?.({ coordinate: cluster.coordinate });
           return;
         }
-
         defaultZoomIntoCluster(cluster);
       },
-      [
-        clusterConfig,
-        customOnPress,
-        defaultZoomIntoCluster,
-        parsed.markerPressHandlers,
-      ],
+      [clusterConfig, customOnPress, defaultZoomIntoCluster],
     );
 
     // ------------------------------------------------------------------
-    // Build the native marker list — clustered or passthrough
+    // Build native marker lists for classic markers
     // ------------------------------------------------------------------
     const renderClusterFn = clusterConfig?.renderCluster;
     const { nativeMarkers, clusterSnapshots, clusterById } = useMemo(() => {
@@ -918,8 +939,6 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       const snaps: MarkerSnapshot[] = [];
       const byId = new Map<string, Cluster>();
 
-      // Lookup tables so singleton clusters can restore the ORIGINAL
-      // marker payload + snapshot (preserving its custom-vs-native type).
       const markerById = new Map<string, NativeMarker>();
       for (const m of parsed.markers) markerById.set(m.id, m);
       const snapshotByMarkerId = new Map<string, MarkerSnapshot>();
@@ -929,18 +948,10 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         isCustomById.set(meta.id, meta.isCustom);
       }
 
-      // 1) ignored markers pass through verbatim, with their original
-      //    native marker entry + any custom snapshot children.
       for (const m of parsed.markers) {
         if (passthroughIds.has(m.id)) out.push(m);
       }
 
-      // 2) cluster results.
-      //
-      //    Singletons restore the ORIGINAL marker (native pin or custom
-      //    snapshot per the marker's children prop); multi-clusters get
-      //    a synthetic cluster marker rendered via renderCluster.
-      //    See {@link resolveCluster} for the pure decision logic.
       for (const c of clusters) {
         const resolved = resolveCluster<NativeMarker, MarkerSnapshot>({
           cluster: c,
@@ -983,8 +994,89 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       renderClusterFn,
     ]);
 
-    // Combine "real" snapshots (only those that survive passthrough) with cluster snapshots.
-    const allSnapshots = useMemo(() => {
+    // ------------------------------------------------------------------
+    // Build native marker list for ADVANCED markers
+    // ------------------------------------------------------------------
+    const {
+      nativeAdvancedMarkers,
+      advancedClusterSnapshots,
+      advancedClusterById,
+    } = useMemo(() => {
+      if (!clusteringEnabled) {
+        return {
+          nativeAdvancedMarkers: parsed.advancedMarkers,
+          advancedClusterSnapshots: [] as MarkerSnapshot[],
+          advancedClusterById: new Map<string, Cluster>(),
+        };
+      }
+      const out: NativeAdvancedMarker[] = [];
+      const snaps: MarkerSnapshot[] = [];
+      const byId = new Map<string, Cluster>();
+
+      const markerById = new Map<string, NativeAdvancedMarker>();
+      for (const m of parsed.advancedMarkers) markerById.set(m.id, m);
+      const snapshotByMarkerId = new Map<string, MarkerSnapshot>();
+      for (const s of parsed.advancedMarkerSnapshots)
+        snapshotByMarkerId.set(s.id, s);
+      const isCustomById = new Map<string, boolean>();
+      for (const meta of parsed.advancedMarkerMeta.values()) {
+        isCustomById.set(meta.id, meta.isCustom);
+      }
+
+      for (const m of parsed.advancedMarkers) {
+        if (advancedPassthroughIds.has(m.id)) out.push(m);
+      }
+
+      for (const c of advancedClusters) {
+        const resolved = resolveCluster<NativeAdvancedMarker, MarkerSnapshot>({
+          cluster: c,
+          markerById,
+          snapshotByMarkerId,
+          isCustomById,
+          makeClusterMarker: cluster => {
+            const stableId = stableClusterKey(cluster);
+            return {
+              id: `${ADVANCED_CLUSTER_MARKER_PREFIX}${stableId}`,
+              latitude: cluster.coordinate.latitude,
+              longitude: cluster.coordinate.longitude,
+              hasCustomView: true,
+              isCluster: true,
+              anchor: { x: 0.5, y: 0.5 },
+            } as NativeAdvancedMarker;
+          },
+          makeClusterSnapshot: (cluster, syntheticId) => {
+            const node = renderClusterFn ? (
+              renderClusterFn(cluster as Cluster)
+            ) : (
+              <DefaultClusterBubble cluster={cluster as Cluster} />
+            );
+            return { id: syntheticId, children: node };
+          },
+        });
+        if (!resolved) continue;
+        out.push(resolved.marker);
+        if (resolved.snapshot) snaps.push(resolved.snapshot);
+        if (resolved.isCluster) byId.set(resolved.marker.id, c);
+      }
+      return {
+        nativeAdvancedMarkers: out,
+        advancedClusterSnapshots: snaps,
+        advancedClusterById: byId,
+      };
+    }, [
+      clusteringEnabled,
+      advancedClusters,
+      parsed.advancedMarkers,
+      parsed.advancedMarkerSnapshots,
+      parsed.advancedMarkerMeta,
+      advancedPassthroughIds,
+      renderClusterFn,
+    ]);
+
+    // Snapshots that go into the rasterized snapshot root (classic markers
+    // + classic cluster bubbles + advanced cluster bubbles since the
+    // synthetic bubble's renderCluster output is a generic React tree).
+    const classicSnapshots = useMemo(() => {
       if (!clusteringEnabled) return parsed.markerSnapshots;
       const live = parsed.markerSnapshots.filter(s => passthroughIds.has(s.id));
       return [...live, ...clusterSnapshots];
@@ -995,8 +1087,26 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       passthroughIds,
     ]);
 
+    // Snapshots routed to the ADVANCED-marker iconView pipeline. These are
+    // the individual <AdvancedMarker> children (kept around for passthrough)
+    // plus the synthetic cluster-bubble snapshots — the latter need to ride
+    // along on the advanced pipeline so the cluster bubble itself can be an
+    // advanced marker.
+    const advancedSnapshots = useMemo(() => {
+      if (!clusteringEnabled) return parsed.advancedMarkerSnapshots;
+      const live = parsed.advancedMarkerSnapshots.filter(s =>
+        advancedPassthroughIds.has(s.id),
+      );
+      return [...live, ...advancedClusterSnapshots];
+    }, [
+      clusteringEnabled,
+      parsed.advancedMarkerSnapshots,
+      advancedClusterSnapshots,
+      advancedPassthroughIds,
+    ]);
+
     // ------------------------------------------------------------------
-    // Marker view (snapshot) wiring
+    // Marker view (snapshot) wiring — classic
     // ------------------------------------------------------------------
     const setMarkerView = useCallback(
       (markerId: string, node: View | null) => {
@@ -1014,20 +1124,58 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
             markerViewTag,
           );
         } catch {
-          /* see below */
+          /* race */
         }
       },
       [getReactTag],
     );
 
     useEffect(() => {
-      allSnapshots.forEach(({ id }) => {
+      classicSnapshots.forEach(({ id }) => {
         const markerViewTag = markerViewTags.current.get(id);
         if (markerViewTag != null) {
           NativeMapViewManager.setMarkerView(getReactTag(), id, markerViewTag);
         }
       });
-    }, [getReactTag, allSnapshots, nativeMarkers]);
+    }, [getReactTag, classicSnapshots, nativeMarkers]);
+
+    // ------------------------------------------------------------------
+    // Marker view wiring — ADVANCED (iconView)
+    // ------------------------------------------------------------------
+    const setAdvancedMarkerView = useCallback(
+      (markerId: string, node: View | null) => {
+        if (!node) {
+          advancedMarkerViewTags.current.delete(markerId);
+          return;
+        }
+        const markerViewTag = findNodeHandle(node);
+        if (markerViewTag == null) return;
+        advancedMarkerViewTags.current.set(markerId, markerViewTag);
+        const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
+        if (typeof fn !== 'function') return;
+        try {
+          fn(getReactTag(), markerId, markerViewTag);
+        } catch {
+          /* race */
+        }
+      },
+      [getReactTag],
+    );
+
+    useEffect(() => {
+      const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
+      if (typeof fn !== 'function') return;
+      advancedSnapshots.forEach(({ id }) => {
+        const tagId = advancedMarkerViewTags.current.get(id);
+        if (tagId != null) {
+          try {
+            fn(getReactTag(), id, tagId);
+          } catch {
+            /* race */
+          }
+        }
+      });
+    }, [getReactTag, advancedSnapshots, nativeAdvancedMarkers]);
 
     // ------------------------------------------------------------------
     // Container layout — tracks viewport pixel dimensions
@@ -1042,14 +1190,22 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     }, []);
 
     // ------------------------------------------------------------------
-    // Marker press dispatch — routes cluster taps to handleClusterPress
+    // Marker press dispatch — routes both classic and advanced clusters
     // ------------------------------------------------------------------
     const handleMarkerPress = useCallback(
       (event: EventPayload<{ id: string; coordinate: Coordinate }>) => {
         const id = event.nativeEvent.id;
         if (clusteringEnabled && id.startsWith(CLUSTER_MARKER_PREFIX)) {
           const cluster = clusterById.get(id);
-          if (cluster) handleClusterPress(cluster);
+          if (cluster) handleClusterPress(cluster, parsed.markerPressHandlers);
+          return;
+        }
+        if (
+          clusteringEnabled &&
+          id.startsWith(ADVANCED_CLUSTER_MARKER_PREFIX)
+        ) {
+          const cluster = advancedClusterById.get(id);
+          if (cluster) handleClusterPress(cluster, parsed.markerPressHandlers);
           return;
         }
         parsed.markerPressHandlers.get(id)?.({
@@ -1059,16 +1215,12 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       [
         clusteringEnabled,
         clusterById,
+        advancedClusterById,
         handleClusterPress,
         parsed.markerPressHandlers,
       ],
     );
 
-    // ------------------------------------------------------------------
-    // Region tracking — feeds into the drag gate. Clustering only ever
-    // recomputes via gate-emitted idle-timeout events, NEVER directly off
-    // raw region-change-complete, which would re-fire during fling decay.
-    // ------------------------------------------------------------------
     const handleRegionChange = useCallback(
       (
         event: EventPayload<{ region: Region; details?: RegionChangeDetails }>,
@@ -1108,9 +1260,11 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         <NativeMapView
           ref={nativeRef}
           {...props}
+          mapId={resolvedMapId}
           initialRegion={initialRegion}
           region={region}
           markers={nativeMarkers}
+          advancedMarkers={nativeAdvancedMarkers as any}
           polylines={parsed.polylines}
           circles={parsed.circles}
           customMapStyle={
@@ -1175,23 +1329,52 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
           collapsable={Platform.OS === 'android' ? false : props.collapsable}
           style={StyleSheet.absoluteFill}
         />
+
+        {/* Classic snapshot root — rasterized into BitmapDescriptor / UIImage */}
         {(Platform.OS === 'android' || Platform.OS === 'ios') &&
-        allSnapshots.length > 0 ? (
+        classicSnapshots.length > 0 ? (
           <View pointerEvents="none" style={styles.markerSnapshotRoot}>
-            {allSnapshots.map(snapshot => (
+            {classicSnapshots.map(snapshot => (
               <View
                 key={snapshot.id}
                 ref={node => setMarkerView(snapshot.id, node)}
                 collapsable={false}
                 renderToHardwareTextureAndroid
                 onLayout={() => {
-                  const markerViewTag = markerViewTags.current.get(snapshot.id);
-                  if (markerViewTag != null) {
+                  const tagId = markerViewTags.current.get(snapshot.id);
+                  if (tagId != null) {
                     NativeMapViewManager.setMarkerView(
                       getReactTag(),
                       snapshot.id,
-                      markerViewTag,
+                      tagId,
                     );
+                  }
+                }}
+              >
+                {snapshot.children}
+              </View>
+            ))}
+          </View>
+        ) : null}
+
+        {/* Advanced snapshot root — attached as native iconView (no raster) */}
+        {(Platform.OS === 'android' || Platform.OS === 'ios') &&
+        advancedSnapshots.length > 0 ? (
+          <View pointerEvents="none" style={styles.markerSnapshotRoot}>
+            {advancedSnapshots.map(snapshot => (
+              <View
+                key={`adv-${snapshot.id}`}
+                ref={node => setAdvancedMarkerView(snapshot.id, node)}
+                collapsable={false}
+                onLayout={() => {
+                  const tagId = advancedMarkerViewTags.current.get(snapshot.id);
+                  const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
+                  if (tagId != null && typeof fn === 'function') {
+                    try {
+                      fn(getReactTag(), snapshot.id, tagId);
+                    } catch {
+                      /* race */
+                    }
                   }
                 }}
               >

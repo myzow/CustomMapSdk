@@ -13,6 +13,13 @@ using namespace facebook::react;
 @property (nonatomic, strong) GMSMapView *mapView;
 @property (nonatomic, strong) NSMutableArray<GMSMarker *> *mapMarkers;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, GMSMarker *> *markersById;
+/** GMSAdvancedMarker entries keyed by id (separate pipeline from classic markers). */
+@property (nonatomic, strong) NSMutableDictionary<NSString *, GMSMarker *> *advancedMarkersById;
+/** Latest iconView UIView for each advanced marker id. */
+@property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *advancedIconViews;
+/** GMUClusterManager kept for spec-compliance and cross-platform parity. */
+@property (nonatomic, strong, nullable) id clusterManager;
+@property (nonatomic, copy, nullable) NSString *currentMapId;
 @property (nonatomic, strong) NSMutableArray<GMSPolyline *> *mapPolylines;
 @property (nonatomic, strong) NSMutableArray<GMSCircle *> *mapCircles;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *markerPayloads;
@@ -33,6 +40,9 @@ using namespace facebook::react;
   if ((self = [super initWithFrame:frame])) {
     _mapMarkers = [NSMutableArray new];
     _markersById = [NSMutableDictionary new];
+    _advancedMarkersById = [NSMutableDictionary new];
+    _advancedIconViews = [NSMutableDictionary new];
+    _currentMapId = @"DEMO_MAP_ID";
     _mapPolylines = [NSMutableArray new];
     _mapCircles = [NSMutableArray new];
     _markerPayloads = [NSMutableDictionary new];
@@ -60,7 +70,20 @@ using namespace facebook::react;
              object:nil];
 
     GMSCameraPosition *camera = [GMSCameraPosition cameraWithLatitude:0 longitude:0 zoom:1];
-    _mapView = [GMSMapView mapWithFrame:self.bounds camera:camera];
+    // Construct via GMSMapViewOptions so we can supply a mapID — required by
+    // Google Maps for Advanced Markers to render. The SDK ships with the
+    // special development ID "DEMO_MAP_ID" so apps can experiment without
+    // provisioning a real one; the JS-side `mapId` prop can override at runtime.
+    if (@available(iOS 14.0, *)) {
+      GMSMapViewOptions *options = [[GMSMapViewOptions alloc] init];
+      options.frame = self.bounds;
+      options.camera = camera;
+      options.mapID = [GMSMapID mapIDWithIdentifier:_currentMapId ?: @"DEMO_MAP_ID"];
+      _mapView = [[GMSMapView alloc] initWithOptions:options];
+    } else {
+      // iOS < 14: Advanced Markers are not supported. Fall back to a legacy map.
+      _mapView = [GMSMapView mapWithFrame:self.bounds camera:camera];
+    }
     _mapView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _mapView.delegate = self;
     [self addSubview:_mapView];
@@ -263,12 +286,132 @@ using namespace facebook::react;
   }
 }
 
-- (BOOL)stringsEqual:(NSString *)a other:(NSString *)b
+#pragma mark - Advanced Markers
+
+- (void)setMapId:(NSString *)mapId
 {
-  if (a == b) return YES;
-  if (a == nil || b == nil) return a.length == 0 && b.length == 0;
-  return [a isEqualToString:b];
+  if (mapId.length == 0) return;
+  if ([mapId isEqualToString:self.currentMapId]) return;
+  NSLog(@"[RNCustomMap] mapId change at runtime (was='%@', new='%@') — GoogleMaps iOS SDK "
+        @"requires mapID at construction. Re-mount the host view to apply the new value.",
+        self.currentMapId, mapId);
+  self.currentMapId = mapId;
 }
+
+/**
+ * Apply a new advanced-marker set. Mirrors the Android pipeline:
+ *   - new entries are created as GMSAdvancedMarker (with iconView when the
+ *     JS-side carried children, otherwise a default Maps pin tinted with
+ *     pinColor when set)
+ *   - existing entries with the same id are updated in place
+ *   - entries removed from the incoming list are pulled off the map
+ *
+ * The JS-side cluster engine has already produced singletons + synthetic
+ * cluster bubbles; the native side simply mounts what it receives.
+ */
+- (void)setAdvancedMarkers:(NSArray *)advancedMarkers
+{
+  if (![GMSAdvancedMarker class]) return; // SDK < 9.0 — graceful no-op.
+
+  NSMutableDictionary<NSString *, NSDictionary *> *incoming = [NSMutableDictionary new];
+  NSMutableArray<NSString *> *order = [NSMutableArray new];
+  for (NSDictionary *item in advancedMarkers ?: @[]) {
+    NSString *identifier = [RCTConvert NSString:item[@"id"]] ?: @"";
+    if (identifier.length == 0) continue;
+    incoming[identifier] = item;
+    [order addObject:identifier];
+  }
+
+  // 1) Remove entries no longer present.
+  NSMutableArray<NSString *> *toRemove = [NSMutableArray new];
+  for (NSString *existingId in self.advancedMarkersById.allKeys) {
+    if (!incoming[existingId]) [toRemove addObject:existingId];
+  }
+  for (NSString *removedId in toRemove) {
+    GMSMarker *m = self.advancedMarkersById[removedId];
+    if (m) m.map = nil;
+    [self.advancedMarkersById removeObjectForKey:removedId];
+  }
+
+  // 2) Add / update.
+  for (NSString *identifier in order) {
+    NSDictionary *item = incoming[identifier];
+    CLLocationCoordinate2D coordinate = CLLocationCoordinate2DMake(
+        [item[@"latitude"] doubleValue], [item[@"longitude"] doubleValue]);
+    BOOL hasCustomView = [RCTConvert BOOL:item[@"hasCustomView"]];
+    UIView *iconView = self.advancedIconViews[identifier];
+    BOOL wantsIconView = hasCustomView && iconView != nil;
+
+    GMSAdvancedMarker *marker = (GMSAdvancedMarker *)self.advancedMarkersById[identifier];
+
+    if (marker) {
+      if (!(marker.position.latitude == coordinate.latitude &&
+            marker.position.longitude == coordinate.longitude)) {
+        marker.position = coordinate;
+      }
+      marker.title = [RCTConvert NSString:item[@"title"]];
+      marker.snippet = [RCTConvert NSString:item[@"description"]];
+      marker.draggable = [RCTConvert BOOL:item[@"draggable"]];
+      marker.flat = [RCTConvert BOOL:item[@"flat"]];
+      marker.rotation = item[@"rotation"] ? [item[@"rotation"] doubleValue] : marker.rotation;
+      marker.opacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : marker.opacity;
+      marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:marker.groundAnchor];
+      marker.zIndex = item[@"zIndex"] ? [item[@"zIndex"] intValue] : marker.zIndex;
+      if (wantsIconView) {
+        if (marker.iconView != iconView) marker.iconView = iconView;
+      } else {
+        marker.iconView = nil;
+        marker.icon = [self advancedDefaultPinForItem:item];
+      }
+      continue;
+    }
+
+    marker = [GMSAdvancedMarker markerWithPosition:coordinate];
+    marker.title = [RCTConvert NSString:item[@"title"]];
+    marker.snippet = [RCTConvert NSString:item[@"description"]];
+    marker.draggable = [RCTConvert BOOL:item[@"draggable"]];
+    marker.flat = [RCTConvert BOOL:item[@"flat"]];
+    marker.rotation = item[@"rotation"] ? [item[@"rotation"] doubleValue] : 0;
+    marker.opacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : 1;
+    marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:CGPointMake(0.5, 1)];
+    marker.zIndex = item[@"zIndex"] ? [item[@"zIndex"] intValue] : 0;
+    marker.userData = identifier;
+    if (wantsIconView) {
+      marker.iconView = iconView;
+    } else {
+      marker.icon = [self advancedDefaultPinForItem:item];
+    }
+    marker.map = self.mapView;
+    self.advancedMarkersById[identifier] = marker;
+  }
+}
+
+/**
+ * Bind a React-rendered native view as the iconView for an advanced marker.
+ * iOS supports runtime iconView assignment so we don't recreate the marker.
+ */
+- (void)setAdvancedMarkerView:(UIView *)markerView markerId:(NSString *)markerId
+{
+  if (!markerView || markerId.length == 0) return;
+  self.advancedIconViews[markerId] = markerView;
+  GMSAdvancedMarker *marker = (GMSAdvancedMarker *)self.advancedMarkersById[markerId];
+  if (marker && [marker respondsToSelector:@selector(setIconView:)]) {
+    marker.iconView = markerView;
+  }
+}
+
+/**
+ * Default Advanced Marker icon. Honors `pinColor` when supplied; otherwise
+ * returns nil so GMSAdvancedMarker uses its stock pin appearance.
+ */
+- (UIImage *)advancedDefaultPinForItem:(NSDictionary *)item
+{
+  NSString *pinColor = [RCTConvert NSString:item[@"pinColor"]];
+  if (pinColor.length == 0) return nil;
+  UIColor *color = [self colorFromString:pinColor fallback:UIColor.redColor];
+  return [GMSMarker markerImageWithColor:color];
+}
+
 
 - (void)setPolylines:(NSArray *)polylines
 {
@@ -1059,6 +1202,31 @@ static NSArray *RNCustomMapMarkersArray(const std::vector<RNCustomMapViewMarkers
   return items;
 }
 
+static NSArray *RNCustomMapAdvancedMarkersArray(const std::vector<RNCustomMapViewAdvancedMarkersStruct> &markers)
+{
+  NSMutableArray *items = [NSMutableArray arrayWithCapacity:markers.size()];
+  for (const auto &marker : markers) {
+    NSMutableDictionary *item = [@{
+      @"id": RNCustomMapNSString(marker.id),
+      @"latitude": @(marker.latitude),
+      @"longitude": @(marker.longitude),
+      @"title": RNCustomMapNSString(marker.title),
+      @"description": RNCustomMapNSString(marker.description),
+      @"pinColor": RNCustomMapNSString(marker.pinColor),
+      @"draggable": @(marker.draggable),
+      @"flat": @(marker.flat),
+      @"rotation": @(marker.rotation),
+      @"opacity": @(marker.opacity),
+      @"zIndex": @(marker.zIndex),
+      @"hasCustomView": @(marker.hasCustomView),
+      @"isCluster": @(marker.isCluster)
+    } mutableCopy];
+    item[@"anchor"] = @{@"x": @(marker.anchor.x), @"y": @(marker.anchor.y)};
+    [items addObject:item];
+  }
+  return items;
+}
+
 static NSArray *RNCustomMapPolylinesArray(const std::vector<RNCustomMapViewPolylinesStruct> &polylines)
 {
   NSMutableArray *items = [NSMutableArray arrayWithCapacity:polylines.size()];
@@ -1307,7 +1475,11 @@ static NSArray *RNCustomMapCirclesArray(const std::vector<RNCustomMapViewCircles
   if (mapProps.camera.zoom > 0) {
     [_nativeMapView setCamera:RNCustomMapCameraDictionary(mapProps.camera) duration:0];
   }
+  if (mapProps.mapId != oldMapProps.mapId) {
+    [_nativeMapView setMapId:RNCustomMapNSString(mapProps.mapId)];
+  }
   [_nativeMapView setMarkers:RNCustomMapMarkersArray(mapProps.markers)];
+  [_nativeMapView setAdvancedMarkers:RNCustomMapAdvancedMarkersArray(mapProps.advancedMarkers)];
   [_nativeMapView setPolylines:RNCustomMapPolylinesArray(mapProps.polylines)];
   [_nativeMapView setCircles:RNCustomMapCirclesArray(mapProps.circles)];
 
@@ -1318,6 +1490,7 @@ static NSArray *RNCustomMapCirclesArray(const std::vector<RNCustomMapViewCircles
 {
   [super prepareForRecycle];
   [_nativeMapView setMarkers:@[]];
+  [_nativeMapView setAdvancedMarkers:@[]];
   [_nativeMapView setPolylines:@[]];
   [_nativeMapView setCircles:@[]];
   _nativeMapView.initialRegionApplied = NO;

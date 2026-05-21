@@ -101,6 +101,13 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
   final Map<String, CustomTarget<android.graphics.Bitmap>> markerIconTargets = new HashMap<>();
   /** Cache of rasterized React-view bitmaps keyed by (markerId+viewIdentity+size). */
   final Map<String, com.google.android.gms.maps.model.BitmapDescriptor> markerViewBitmaps = new HashMap<>();
+  /** Advanced-marker pipeline state. See {@link RNAdvancedMarkers}. */
+  final RNAdvancedMarkers.State advancedState = new RNAdvancedMarkers.State();
+  /** Whether clustering should be applied to advanced markers. */
+  boolean advancedClusteringEnabled = true;
+  /** Pending advanced markers payload, applied after onMapReady. */
+  @Nullable com.facebook.react.bridge.ReadableArray pendingAdvancedMarkers;
+  @Nullable String mapId;
 
   private final List<Runnable> pending = new ArrayList<>();
   @Nullable String selectedMarkerId;
@@ -127,7 +134,13 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
 
   public RNCustomMapView(ReactContext context) {
     super(context);
-    mapView = new MapView(context);
+    // Default mapId enables Advanced Markers out of the box for development.
+    // Apps can override via the `mapId` prop, though changing it post-mount
+    // requires the map to be recreated (see {@link #applyMapIdIfNeeded}).
+    com.google.android.gms.maps.GoogleMapOptions options =
+        new com.google.android.gms.maps.GoogleMapOptions().mapId("DEMO_MAP_ID");
+    mapId = "DEMO_MAP_ID";
+    mapView = new MapView(context, options);
     // Create only; do NOT call onStart/onResume here. The actual start/resume
     // is driven by onAttachedToWindow + the JS lifecycle hook, which makes
     // the map robust across bottom-tab focus changes on API 30/33.
@@ -135,6 +148,21 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
     lifecycleCreated = true;
     addView(mapView, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
     mapView.getMapAsync(this);
+  }
+
+  /**
+   * Apply a new mapId. If the value differs from the current one, logs a
+   * warning — Maps SDK does not support changing the mapId post-construction.
+   * Apps should set the prop once on first mount.
+   */
+  void applyMapId(@Nullable String newMapId) {
+    if (newMapId == null || newMapId.isEmpty()) return;
+    if (newMapId.equals(mapId)) return;
+    android.util.Log.w("RNCustomMapView",
+        "mapId change requested at runtime (was='" + mapId + "', new='" + newMapId +
+        "') — Google Maps Android SDK requires the mapId to be set at MapView " +
+        "construction. Restart the host screen to apply the new value.");
+    mapId = newMapId;
   }
 
   // ------------------------------------------------------------------------
@@ -279,6 +307,59 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
     }
   }
 
+  /**
+   * Composite marker-click handler. Tried in order:
+   * <ol>
+   *   <li>ClusterManager (when active) — routes advanced cluster bubbles and
+   *       items registered through its MarkerManager collections.</li>
+   *   <li>Classic-marker logic — fires onMarkerPress / onMarkerSelect against
+   *       the legacy {@link #markers} table.</li>
+   * </ol>
+   */
+  boolean handleMarkerClick(@NonNull Marker marker) {
+    if (advancedState.clusterManager != null && advancedState.usingClusterManager) {
+      Object tagObj = marker.getTag();
+      String tagStr = tagObj instanceof String ? (String) tagObj : "";
+      if (tagStr.startsWith("acluster:")) {
+        // Synthetic cluster bubble — emit to JS for cluster expansion.
+        emitMarkerEvent("onMarkerPress", marker);
+        return true;
+      }
+      // Hand off to the cluster manager so its internal MarkerManager can
+      // dispatch (covers advanced markers added through it).
+      if (advancedState.clusterManager.onMarkerClick(marker)) {
+        return true;
+      }
+    }
+    return handleClassicMarkerClick(marker);
+  }
+
+  /** Legacy classic-marker click flow, unchanged. */
+  private boolean handleClassicMarkerClick(@NonNull Marker marker) {
+    Object tag = marker.getTag();
+    String id = tag instanceof String ? (String) tag : "";
+    if (markerTappables.containsKey(id) && !Boolean.TRUE.equals(markerTappables.get(id))) {
+      return true;
+    }
+    if (selectedMarkerId != null && !selectedMarkerId.equals(id)) {
+      Marker selectedMarker = markers.get(selectedMarkerId);
+      if (selectedMarker != null) {
+        emitMarkerEvent("onMarkerDeselect", selectedMarker);
+      }
+    }
+    selectedMarkerId = id;
+    emitMarkerEvent("onMarkerPress", marker);
+    emitMarkerEvent("onMarkerSelect", marker);
+    return false;
+  }
+
+  /** Re-attach our composite click listener — called after ClusterManager grabs it. */
+  void restoreMarkerClickListener() {
+    if (googleMap != null) {
+      googleMap.setOnMarkerClickListener(this::handleMarkerClick);
+    }
+  }
+
   // ------------------------------------------------------------------------
   // GoogleMap ready
   // ------------------------------------------------------------------------
@@ -288,23 +369,7 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
     googleMap = map;
     map.setOnMapClickListener(latLng -> emitCoordinate("onPress", latLng));
     map.setOnMapLongClickListener(latLng -> emitCoordinate("onLongPress", latLng));
-    map.setOnMarkerClickListener(marker -> {
-      Object tag = marker.getTag();
-      String id = tag instanceof String ? (String) tag : "";
-      if (markerTappables.containsKey(id) && !Boolean.TRUE.equals(markerTappables.get(id))) {
-        return true;
-      }
-      if (selectedMarkerId != null && !selectedMarkerId.equals(id)) {
-        Marker selectedMarker = markers.get(selectedMarkerId);
-        if (selectedMarker != null) {
-          emitMarker("onMarkerDeselect", selectedMarker);
-        }
-      }
-      selectedMarkerId = id;
-      emitMarker("onMarkerPress", marker);
-      emitMarker("onMarkerSelect", marker);
-      return false;
-    });
+    map.setOnMarkerClickListener(this::handleMarkerClick);
     map.setOnInfoWindowClickListener(marker -> emitMarker("onCalloutPress", marker));
     map.setOnPolylineClickListener(polyline -> {
       WritableMap event = Arguments.createMap();
@@ -320,7 +385,14 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
     map.setOnCameraMoveStartedListener(reason ->
         lastRegionChangeWasGesture = reason == GoogleMap.OnCameraMoveStartedListener.REASON_GESTURE);
     map.setOnCameraMoveListener(() -> emitRegion("onRegionChange"));
-    map.setOnCameraIdleListener(() -> emitRegion("onRegionChangeComplete"));
+    map.setOnCameraIdleListener(() -> {
+      // Forward to AdvancedMarkers cluster manager when present so clusters
+      // recompute on idle. Safe to call when no advanced markers are mounted.
+      if (advancedState.clusterManager != null) {
+        advancedState.clusterManager.onCameraIdle();
+      }
+      emitRegion("onRegionChangeComplete");
+    });
     map.setOnMyLocationChangeListener(this::emitUserLocation);
     map.setMinZoomPreference(minZoom);
     map.setMaxZoomPreference(maxZoom);
@@ -329,6 +401,14 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
       runnable.run();
     }
     pending.clear();
+
+    // Apply any pending advanced-marker payload now that the map is ready.
+    if (pendingAdvancedMarkers != null) {
+      RNAdvancedMarkers.setAdvancedMarkers(this, pendingAdvancedMarkers, advancedClusteringEnabled);
+      pendingAdvancedMarkers = null;
+    }
+    RNAdvancedMarkers.onMapReady(this);
+
     emitEmpty("onMapReady");
   }
 

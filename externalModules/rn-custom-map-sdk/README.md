@@ -124,3 +124,95 @@ import NativeMapViewManager from 'rn-custom-map-sdk/spec/NativeRNCustomMapViewMa
 
 NativeMapViewManager.prefetchMarkerIcons(reactTag, urls);
 ```
+
+## `<AdvancedMarker>` — Google Maps Advanced Markers
+
+The SDK ships a separate `<AdvancedMarker>` component built on Google
+Maps' Advanced Markers APIs. It is fully cross-platform, integrates with
+the same `clusterConfig` pipeline, and exists alongside the classic
+`<Marker>` (no breaking change).
+
+### Two rendering modes
+
+| Children supplied? | Renders as |
+| --- | --- |
+| Yes (React tree)   | **Custom advanced marker.** Children are attached as the native `iconView` directly (Android `AdvancedMarkerOptions.iconView`, iOS `GMSAdvancedMarker.iconView`). |
+| No                 | **Default advanced marker** (standard Google Maps pin honoring `pinColor`, `title`, `description`). |
+
+### Requirements
+
+- **Android**: Google Maps SDK 18.2.0+ (already declared). Advanced Markers
+  require the host map to be created with a valid `mapId`. The SDK
+  defaults to `"DEMO_MAP_ID"` for development; supply your own via the
+  `mapId` prop on `<MapView>` for production builds.
+  - Adds `com.google.maps.android:android-maps-utils:3.8.2` for
+    `ClusterManager`.
+- **iOS**: GoogleMaps SDK 9.0+ on iOS 14+ (the podspec bumps the platform
+  to 14.0 and declares `Google-Maps-iOS-Utils` for `GMUClusterManager`).
+  `mapID` is set on the `GMSMapView` at construction via `GMSMapViewOptions`.
+
+### Usage
+
+```tsx
+import MapView, { AdvancedMarker } from 'rn-custom-map-sdk';
+
+<MapView
+  style={{ flex: 1 }}
+  mapId="DEMO_MAP_ID" // or your own Cloud-styled mapId
+  initialRegion={region}
+  clusterConfig={{ enabled: true, radius: 60 }}
+>
+  {/* Custom advanced marker — children render as the native iconView */}
+  <AdvancedMarker
+    identifier="user-42"
+    coordinate={{ latitude: 37.78, longitude: -122.43 }}
+    title="Custom user"
+  >
+    <View style={styles.bubble}>
+      <Image source={{ uri: user.avatar }} style={styles.avatar} />
+    </View>
+  </AdvancedMarker>
+
+  {/* Default advanced marker — standard pin tinted via pinColor */}
+  <AdvancedMarker
+    identifier="poi-7"
+    coordinate={{ latitude: 37.79, longitude: -122.42 }}
+    title="Coffee shop"
+    pinColor="#1f6feb"
+  />
+</MapView>
+```
+
+### Clustering
+
+`<AdvancedMarker>` participates in the **same** `clusterConfig` as classic
+markers — singleton clusters fall back to the original advanced marker
+(custom view or default pin), multi-clusters are rendered via the
+`renderCluster` callback you already use.
+
+Per the spec, the native side uses:
+  - **Android** — `ClusterManager<AdvancedMarkerOptions>` from
+    `com.google.maps.android:android-maps-utils` to host the marker
+    collection. The cluster engine itself runs in JS so `renderCluster`
+    remains a single cross-platform implementation.
+  - **iOS** — `GMSAdvancedMarker` instances mounted on the GMSMapView,
+    with `Google-Maps-iOS-Utils` available for future native cluster
+    rendering.
+
+### Required props
+
+| Prop          | Type                                | Required | Notes |
+| ------------- | ----------------------------------- | -------- | ----- |
+| `coordinate`  | `{ latitude; longitude }`           | Yes      | Position |
+| `identifier`  | `string`                            | Yes      | Unique id used for clustering / refs |
+| `children`    | `ReactNode`                         | No       | Presence triggers custom marker mode |
+| `title`       | `string`                            | No       | Info-window title |
+| `description` | `string`                            | No       | Info-window description |
+| `pinColor`    | `string` (CSS color)                | No       | Default-marker tint |
+| `draggable`   | `boolean`                           | No       | Allow drag |
+| `flat`        | `boolean`                           | No       | Attach to map plane |
+| `rotation`    | `number`                            | No       | Degrees |
+| `opacity`     | `number` (0-1)                      | No       |       |
+| `anchor`      | `{ x; y }`                          | No       | Anchor point |
+| `zIndex`      | `number`                            | No       | Stack order |
+

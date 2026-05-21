@@ -111,6 +111,19 @@ RCT_EXPORT_METHOD(setMarkerView:(nonnull NSNumber *)reactTag markerId:(NSString 
   });
 }
 
+RCT_EXPORT_METHOD(setAdvancedMarkerView:(nonnull NSNumber *)reactTag markerId:(NSString *)markerId markerViewTag:(nonnull NSNumber *)markerViewTag)
+{
+  dispatch_async(dispatch_get_main_queue(), ^{
+    UIView *markerView = [self.bridge.uiManager viewForReactTag:markerViewTag];
+    if (!markerView) {
+      return;
+    }
+    [self withMap:reactTag block:^(RNCustomMapNativeView *view) {
+      [view setAdvancedMarkerView:markerView markerId:markerId];
+    }];
+  });
+}
+
 // Lifecycle commands are Android-only — no-op on iOS (MapKit/GMS-iOS does
 // not exhibit the bottom-tab white-screen bug), but exposed for cross-platform
 // JS calls to remain symmetric.

@@ -146,6 +146,16 @@ public class RNCustomMapViewManager extends SimpleViewManager<RNCustomMapView> {
     RNCustomMapViewManagerImpl.setMarkers(view, markers);
   }
 
+  @ReactProp(name = "advancedMarkers")
+  public void setAdvancedMarkers(RNCustomMapView view, @Nullable ReadableArray advancedMarkers) {
+    RNCustomMapViewManagerImpl.setAdvancedMarkers(view, advancedMarkers);
+  }
+
+  @ReactProp(name = "mapId")
+  public void setMapId(RNCustomMapView view, @Nullable String mapId) {
+    RNCustomMapViewManagerImpl.setMapId(view, mapId);
+  }
+
   @ReactProp(name = "polylines")
   public void setPolylines(RNCustomMapView view, @Nullable ReadableArray polylines) {
     RNCustomMapViewManagerImpl.setPolylines(view, polylines);

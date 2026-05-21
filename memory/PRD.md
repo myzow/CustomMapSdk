@@ -104,3 +104,112 @@ showed the default Google pin during zoom, drag, and cluster transitions.
 - Module: `externalModules/rn-custom-map-sdk`
 - Tests: `__tests__/iconCache.test.ts`, `dragGate.test.ts`,
   `membership.test.ts`
+
+---
+
+# Feature: `<AdvancedMarker>` (Jan 2026)
+
+## Problem statement (verbatim)
+Create a new, cross-platform AdvancedMarker component for `rn-custom-map-sdk`
+using Google Maps Advanced Markers with full clustering support.
+
+- New `<AdvancedMarker>` as a separate component (existing `<Marker>` untouched).
+- Children → custom advanced marker (rendered as native iconView, not a bitmap).
+- No children → default Google pin honoring `pinColor`, `title`, `description`.
+- Must integrate with the existing `clusterConfig` pipeline.
+- Android: AdvancedMarkerOptions + PinConfig, ClusterManager<AdvancedMarkerOptions>.
+- iOS: GMSAdvancedMarker with iconView; GMUClusterManager available.
+- Both: require a valid `mapId` (default `"DEMO_MAP_ID"`).
+
+## What was implemented
+
+### JS layer
+- `src/AdvancedMarker.tsx` — new virtual component (forwardRef, displayName
+  `RNCustomMapAdvancedMarker`).
+- `src/types.ts` — `AdvancedMarkerProps`, `AdvancedMarkerMethods`,
+  `NativeAdvancedMarker`; `mapId` added to `MapViewProps`.
+- `src/MapView.tsx` — extends `parseChildren` to detect both `<Marker>`
+  and `<AdvancedMarker>` separately. Builds a parallel pipeline:
+  separate clusterable / passthrough split, separate cluster cache, and a
+  separate snapshot root that calls the new `setAdvancedMarkerView` so
+  children are bound as native iconView (no bitmap rasterization). Cluster
+  bubble ids use the `acluster:` prefix; marker press dispatcher recognises
+  both prefixes.
+- `index.tsx` / `index.d.ts` — re-export `AdvancedMarker`.
+
+### Codegen spec
+- `spec/RNCustomMapViewNativeComponent.ts` — adds `advancedMarkers`
+  array and `mapId` props on the native component.
+- `spec/NativeRNCustomMapViewManager.ts` — adds `setAdvancedMarkerView`
+  TurboModule command.
+
+### Android
+- `android/src/main/java/com/rncustommap/RNAdvancedMarkers.java` — new
+  pipeline class. Lazily creates a `ClusterManager<RNAdvancedClusterItem>`
+  from `com.google.maps.android:android-maps-utils:3.8.2` (per spec) and
+  routes advanced markers through its `MarkerManager.Collection` so click
+  semantics are preserved. JS pre-clusters; the renderer's
+  `setMinClusterSize(Integer.MAX_VALUE)` prevents native re-clustering.
+- `RNCustomMapView.java` — constructs the `MapView` with `GoogleMapOptions().mapId("DEMO_MAP_ID")`,
+  hosts the `advancedState`, splits marker click handling into a composite
+  router that restores classic clicks after `ClusterManager` grabs the
+  listener.
+- `RNCustomMapViewManagerImpl.java` — adds `setAdvancedMarkers` /
+  `setMapId` delegates.
+- `RNCustomMapViewManager.java` — registers `@ReactProp("advancedMarkers")`
+  and `@ReactProp("mapId")`.
+- `RNCustomMapModule.java` — implements `setAdvancedMarkerView` calling
+  into `RNAdvancedMarkers.setIconView`.
+- `android/build.gradle` — adds `com.google.maps.android:android-maps-utils:3.8.2`.
+
+### iOS
+- `RNCustomMapView.h` / `.mm` — adds `advancedMarkersById`,
+  `advancedIconViews`, `currentMapId`. The `GMSMapView` is now constructed
+  via `GMSMapViewOptions` with `mapID` set (iOS 14+); legacy fallback on
+  older iOS. New methods: `setMapId:`, `setAdvancedMarkers:`,
+  `setAdvancedMarkerView:markerId:`, `advancedDefaultPinForItem:`. Fabric
+  `updateProps` marshals the new struct via `RNCustomMapAdvancedMarkersArray`.
+- `RNCustomMapViewManager.mm` — registers `advancedMarkers` array prop
+  and `mapId` custom prop on the legacy (Paper) view manager.
+- `RNCustomMapModule.mm` — adds the bridge method `setAdvancedMarkerView`.
+- `ios/RNCustomMap.podspec` + `rn-custom-map-sdk.podspec` — bump platform
+  to iOS 14, add `Google-Maps-iOS-Utils` dep (per spec).
+
+### Docs
+- `README.md` — full `<AdvancedMarker>` section: usage, requirements,
+  clustering behavior, prop table.
+
+## Design decisions
+- **Parallel JS pipeline** for advanced markers (separate cluster pass,
+  separate snapshot root) — avoids touching the existing classic-marker
+  flow. Both pipelines share `clusterConfig` so consumers only configure
+  clustering once.
+- **JS pre-clusters, native renders** — keeps `renderCluster` a single
+  cross-platform implementation. The native ClusterManager is still used
+  to host the marker collection (per spec) but its own clustering algo
+  is disabled (`setMinClusterSize(Integer.MAX_VALUE)`).
+- **iconView vs bitmap** — Android `AdvancedMarkerOptions.iconView(View)`
+  and iOS `GMSAdvancedMarker.iconView` accept the React-rendered view
+  directly, so Lottie / animated content keeps animating (no rasterization).
+- **mapId defaulted to `"DEMO_MAP_ID"`** — Advanced Markers require a
+  cloud-styled mapId; the default lets apps start without provisioning one.
+
+## Verification
+- ✅ TypeScript: `tsc -p externalModules/rn-custom-map-sdk/tsconfig.json --noEmit` clean.
+- ✅ ESLint: SDK clean.
+- ✅ Existing Jest tests: 57 pass (5 suites green; the `App.test.tsx`
+  failure is the pre-existing gesture-handler native-module mock issue
+  unrelated to this change).
+- ⚠ Native Android Gradle / iOS Xcode builds were NOT exercised in this
+  environment (no Android SDK / Xcode). Compile & device validation must
+  happen on the consumer's machine.
+
+## Backlog (P1 / P2)
+- P1: full native ClusterManager-driven clustering (Android + iOS) where
+  the cluster bubble itself is also an AdvancedMarker rendered by the
+  utility library — currently the JS engine produces the bubble and the
+  native ClusterManager is used purely as a marker collection holder.
+- P2: emit `onAdvancedMarkerDragStart/Drag/DragEnd` via dedicated bubbling
+  events instead of routing through `onMarkerDrag*`.
+- P2: support iconView animation lifecycle hooks (pause/resume on tab blur).
+

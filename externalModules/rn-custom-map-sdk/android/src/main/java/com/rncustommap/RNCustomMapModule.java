@@ -348,6 +348,28 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
     });
   }
 
+  /**
+   * Bind a React-rendered view as the iconView of an AdvancedMarker. The
+   * view is attached as a true native subview (no rasterization), so any
+   * animated content keeps rendering. See {@link RNAdvancedMarkers#setIconView}.
+   */
+  @Override
+  public void setAdvancedMarkerView(double reactTag, String markerId, double markerViewTag) {
+    UiThreadUtil.runOnUiThread(() -> {
+      RNCustomMapView mapView = resolveMap((int) reactTag);
+      if (mapView == null) return;
+
+      UIManager uiManager =
+          UIManagerHelper.getUIManagerForReactTag(getReactApplicationContext(), (int) markerViewTag);
+      if (uiManager == null) return;
+
+      View markerView = uiManager.resolveView((int) markerViewTag);
+      if (markerView != null) {
+        RNAdvancedMarkers.setIconView(mapView, markerId, markerView);
+      }
+    });
+  }
+
   // -------------------- Native icon cache --------------------
 
   /**

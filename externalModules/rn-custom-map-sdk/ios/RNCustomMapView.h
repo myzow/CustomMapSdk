@@ -31,6 +31,9 @@
 - (void)setMaxZoomLevel:(NSNumber *)maxZoomLevel;
 - (void)setCustomMapStyle:(NSString *)customMapStyle;
 - (void)setMarkers:(NSArray *)markers;
+- (void)setAdvancedMarkers:(NSArray *)advancedMarkers;
+- (void)setMapId:(NSString *)mapId;
+- (void)setAdvancedMarkerView:(UIView *)markerView markerId:(NSString *)markerId;
 - (void)setPolylines:(NSArray *)polylines;
 - (void)setCircles:(NSArray *)circles;
 - (void)prefetchMarkerIcons:(NSArray<NSString *> *)urls;
