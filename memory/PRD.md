@@ -213,3 +213,43 @@ using Google Maps Advanced Markers with full clustering support.
   events instead of routing through `onMarkerDrag*`.
 - P2: support iconView animation lifecycle hooks (pause/resume on tab blur).
 
+
+
+---
+
+# Feature: AdvancedMarker crash fix + jank elimination (Jan 2026)
+
+## Problem statement (verbatim)
+- Android: App crash and custom child views not displaying when using `<AdvancedMarker>` with children.
+- Android + iOS: Severe lag / jank during map drag and pinch-zoom (markers re-rendering on every camera move).
+- Goal: 60 FPS map interactions, custom React children visible on the marker, samples added to the clustering screen.
+
+## Root causes
+1. **Android crash A** — `MapsInitializer.initialize(ctx, Renderer.LATEST, ...)` was never called. Advanced Markers require the LATEST renderer; on the legacy renderer they throw `UnsupportedOperationException`.
+2. **Android crash B** — `AdvancedMarkerOptions.iconView(view)` was called with a React-managed View that already had a parent (the off-screen snapshot root), triggering `IllegalStateException: child already has a parent`.
+3. **iOS unmounting error** — `GMSAdvancedMarker.iconView = markerView` retained a strong reference to a React-managed UIView; React's later unmount left a dangling pointer.
+4. **Jank** — every cluster recompute re-emitted `setMarkerView` / `setAdvancedMarkerView` for ALL snapshots, and the native side called `marker.setIcon(...)` even when the bitmap was unchanged. Each `setIcon` triggers a Google renderer commit → multiplied across hundreds of markers it's a per-frame stutter.
+
+## Fixes implemented
+- **Android `RNCustomMapView.java`**: calls `MapsInitializer.initialize(ctx, Renderer.LATEST, callback)` in the constructor before `getMapAsync(...)`. Maps SDK queues the callback until the renderer is ready so `onMapReady` fires only after LATEST is active.
+- **Android `RNAdvancedMarkers.java`** (full rewrite): uses the **bitmap path** (`AdvancedMarkerOptions.icon(BitmapDescriptor)`) per Google's high-performance recommendation. The React snapshot View is rasterized via `View.draw(Canvas)` and cached by content signature `(markerId, viewIdentity, size)`. `setIconView` short-circuits when the signature is unchanged. Defensive `try/catch` around marker creation logs and skips on failure rather than crashing the map.
+- **iOS `RNCustomMapView.mm`**: `-setAdvancedMarkerView:markerId:` rasterizes the UIView to a UIImage via `UIGraphicsImageRenderer` and assigns to `marker.icon` (not `iconView`). Caches by `(markerId, view-pointer, size)`; identity-checks against the marker's current icon to skip redundant renderer commits. `-setAdvancedMarkers:` initializes new custom-view markers with a 1×1 transparent placeholder so the default pin never flashes; reuse path no longer touches the icon.
+- **JS `MapView.tsx`**: both snapshot-rebind `useEffect`s (classic + advanced) early-return while `isDragging` is true, eliminating the `O(visibleMarkers)`/frame native bridge calls during gesture.
+- **`ClusteringScreen.tsx`**: added a samples section demonstrating `<AdvancedMarker>` with avatar/profile markers, branded icon+text markers, and an `Animated.View`-based pulse marker.
+
+## Files touched
+- `externalModules/rn-custom-map-sdk/android/src/main/java/com/rncustommap/RNCustomMapView.java`
+- `externalModules/rn-custom-map-sdk/android/src/main/java/com/rncustommap/RNAdvancedMarkers.java`
+- `externalModules/rn-custom-map-sdk/ios/RNCustomMapView.mm`
+- `externalModules/rn-custom-map-sdk/src/MapView.tsx`
+- `src/screens/ClusteringScreen.tsx`
+- `FIXES.md` (added Issues 3, 4, 5)
+
+## Verification
+- ✅ Code-level fixes complete; user will validate on Android Studio + Xcode simulators / devices.
+- ⚠ Native Gradle / Xcode builds were NOT exercised in this environment (no Android SDK / Xcode toolchain). User confirmed they'll run the build themselves.
+
+## Backlog
+- P1: optional "liveView" mode for genuinely animating content (Lottie) — would use a wrapper FrameLayout we own to bypass the parent-attachment crash while preserving live animation. Currently animated children are rasterized as their first laid-out frame.
+- P2: per-marker zoom-level visibility thresholds (hide markers below zoom N) to reduce GPU load on highly dense datasets.
+- P2: optional content-hash signature for iconView caching (in addition to View identity) so prop-driven re-renders of the same JSX tree hit the cache.

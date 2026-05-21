@@ -6,6 +6,87 @@ Google Maps `MapView` instances.
 
 ---
 
+## Issue 3 — Android crashes when `<AdvancedMarker>` has React children
+
+**Root causes.**
+
+1. **`MapsInitializer.initialize(..., Renderer.LATEST, ...)` was never called.**
+   Advanced Markers are only available on the LATEST renderer; without
+   the explicit init the Maps SDK falls back to the legacy renderer and
+   any `AdvancedMarkerOptions` usage throws `UnsupportedOperationException`.
+
+2. **`AdvancedMarkerOptions.iconView(view)` cannot accept an
+   already-parented View.** The React-managed snapshot subtree always has
+   a parent (the off-screen `markerSnapshotRoot`), so attaching it as the
+   marker's iconView triggers
+   `IllegalStateException: The specified child already has a parent`.
+
+**Fix.**
+
+- `RNCustomMapView` now calls
+  `MapsInitializer.initialize(ctx, Renderer.LATEST, callback)` from the
+  constructor, before `mapView.getMapAsync(...)`. Maps SDK queues the
+  callback until the renderer is ready, so by the time `onMapReady` fires
+  the LATEST renderer is active and `AdvancedMarkerOptions` works.
+
+- `RNAdvancedMarkers` was rewritten to use the bitmap path
+  (`AdvancedMarkerOptions.icon(BitmapDescriptor)`) which is also Google's
+  recommended high-performance Advanced Markers strategy. The React
+  snapshot View is rasterized once via `View.draw(Canvas)` and the
+  resulting bitmap is reused — no re-rasterization, no re-parenting, no
+  crash. Defensive `try/catch` around marker creation logs and skips
+  rather than tearing the map down.
+
+---
+
+## Issue 4 — iOS unmounting error / crash on `<AdvancedMarker>` children
+
+**Root cause.** Assigning `GMSAdvancedMarker.iconView = markerView` retained
+a strong reference to a React-managed `UIView`. When React unmounts the
+snapshot (during a cluster transition, key change, screen blur, etc), the
+underlying `UIView` is deallocated but `GMSMarker` still references it —
+classic dangling pointer leading to the "view has been unmounted from the
+React Native view hierarchy" crash.
+
+**Fix.** `-setAdvancedMarkerView:markerId:` now rasterizes the `UIView` to
+a `UIImage` (via `UIGraphicsImageRenderer`) and assigns it to
+`marker.icon`. The image is cached by (markerId, view-pointer, size) so
+cluster recomputes that don't actually change marker content are
+short-circuited. No strong reference to the React `UIView` is held.
+
+---
+
+## Issue 5 — Severe jank during pan/zoom
+
+**Root cause.** Every cluster recompute (which happens on the trailing
+edge of any gesture) re-emits `setMarkerView` / `setAdvancedMarkerView`
+for **all** snapshots, and the native side called `marker.setIcon(...)`
+even when the bitmap was unchanged. Each `setIcon` triggers a Google Maps
+renderer commit — multiplied across hundreds of markers, this is the
+single biggest source of mid-drag stutter.
+
+**Fix.**
+
+- JS-side: `MapView.tsx` now gates the two snapshot-rebind effects on
+  `isDragging`. While the user is actively gesturing, no native rebind
+  calls are issued; the effects fire once when the gesture settles.
+
+- Android native: `RNAdvancedMarkers` keeps a per-marker
+  `(content-signature → BitmapDescriptor)` cache. `setIconView` early-
+  returns when the signature is unchanged, so no `marker.setIcon` call
+  is made.
+
+- iOS native: `-setAdvancedMarkerView:markerId:` performs an identity
+  check on the cached `UIImage` and skips `marker.icon =` when the same
+  image is already on the marker.
+
+Result: redundant marker re-renders during camera moves drop from
+`O(visibleMarkers)` per frame to `O(0)`, restoring the 60 FPS pan/zoom
+target.
+
+
+---
+
 ## Issue 1 — `mapRef.current.animateToRegion()` silently no-ops from edge indicators
 
 **Root cause.** The module's view lookup went through

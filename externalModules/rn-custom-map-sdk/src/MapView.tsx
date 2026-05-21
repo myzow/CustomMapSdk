@@ -1131,13 +1131,14 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     );
 
     useEffect(() => {
+      if (isDragging) return;
       classicSnapshots.forEach(({ id }) => {
         const markerViewTag = markerViewTags.current.get(id);
         if (markerViewTag != null) {
           NativeMapViewManager.setMarkerView(getReactTag(), id, markerViewTag);
         }
       });
-    }, [getReactTag, classicSnapshots, nativeMarkers]);
+    }, [getReactTag, classicSnapshots, nativeMarkers, isDragging]);
 
     // ------------------------------------------------------------------
     // Marker view wiring — ADVANCED (iconView)
@@ -1163,6 +1164,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     );
 
     useEffect(() => {
+      if (isDragging) return;
       const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
       if (typeof fn !== 'function') return;
       advancedSnapshots.forEach(({ id }) => {
@@ -1175,7 +1177,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
           }
         }
       });
-    }, [getReactTag, advancedSnapshots, nativeAdvancedMarkers]);
+    }, [getReactTag, advancedSnapshots, nativeAdvancedMarkers, isDragging]);
 
     // ------------------------------------------------------------------
     // Container layout — tracks viewport pixel dimensions

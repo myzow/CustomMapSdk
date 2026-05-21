@@ -339,12 +339,13 @@ using namespace facebook::react;
     CLLocationCoordinate2D coordinate = CLLocationCoordinate2DMake(
         [item[@"latitude"] doubleValue], [item[@"longitude"] doubleValue]);
     BOOL hasCustomView = [RCTConvert BOOL:item[@"hasCustomView"]];
-    UIView *iconView = self.advancedIconViews[identifier];
-    BOOL wantsIconView = hasCustomView && iconView != nil;
 
     GMSAdvancedMarker *marker = (GMSAdvancedMarker *)self.advancedMarkersById[identifier];
 
     if (marker) {
+      // Reuse: only update mutable fields. The icon is the exclusive
+      // responsibility of -setAdvancedMarkerView:markerId: which keys
+      // by content signature and short-circuits no-ops.
       if (!(marker.position.latitude == coordinate.latitude &&
             marker.position.longitude == coordinate.longitude)) {
         marker.position = coordinate;
@@ -357,11 +358,11 @@ using namespace facebook::react;
       marker.opacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : marker.opacity;
       marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:marker.groundAnchor];
       marker.zIndex = item[@"zIndex"] ? [item[@"zIndex"] intValue] : marker.zIndex;
-      if (wantsIconView) {
-        if (marker.iconView != iconView) marker.iconView = iconView;
-      } else {
-        marker.iconView = nil;
-        marker.icon = [self advancedDefaultPinForItem:item];
+      // For markers without a custom view, refresh the pinColor-tinted
+      // default whenever the prop value changes.
+      if (!hasCustomView) {
+        UIImage *defaultPin = [self advancedDefaultPinForItem:item];
+        if (marker.icon != defaultPin) marker.icon = defaultPin;
       }
       continue;
     }
@@ -376,28 +377,114 @@ using namespace facebook::react;
     marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:CGPointMake(0.5, 1)];
     marker.zIndex = item[@"zIndex"] ? [item[@"zIndex"] intValue] : 0;
     marker.userData = identifier;
-    if (wantsIconView) {
-      marker.iconView = iconView;
+    if (hasCustomView) {
+      // Transparent placeholder so the default pin never flashes. The
+      // real bitmap arrives via -setAdvancedMarkerView:markerId: shortly.
+      marker.icon = [self transparentPlaceholderImage];
+      marker.tracksViewChanges = NO;
     } else {
       marker.icon = [self advancedDefaultPinForItem:item];
     }
     marker.map = self.mapView;
     self.advancedMarkersById[identifier] = marker;
+
+    // If we already have a cached snapshot view for this id (from a
+    // previous mount in the same session), apply it immediately so the
+    // user doesn't see the placeholder.
+    UIView *cachedView = self.advancedIconViews[identifier];
+    if (hasCustomView && cachedView) {
+      [self setAdvancedMarkerView:cachedView markerId:identifier];
+    }
   }
 }
 
 /**
- * Bind a React-rendered native view as the iconView for an advanced marker.
- * iOS supports runtime iconView assignment so we don't recreate the marker.
+ * 1x1 transparent placeholder used as the initial icon for advanced
+ * markers that carry a React-rendered child view. Replaced as soon as
+ * -setAdvancedMarkerView:markerId: lands. Cached so we never allocate
+ * more than one of these per process.
+ */
+- (UIImage *)transparentPlaceholderImage
+{
+  static UIImage *placeholder;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.opaque = NO;
+    UIGraphicsImageRenderer *renderer =
+        [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(1, 1) format:fmt];
+    placeholder = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
+      CGContextClearRect(ctx.CGContext, CGRectMake(0, 0, 1, 1));
+    }];
+  });
+  return placeholder;
+}
+
+/**
+ * Bind a React-rendered native view as the visual for an advanced marker.
+ *
+ * <p>This method intentionally <b>does not</b> assign {@code marker.iconView}
+ * even though GMSAdvancedMarker supports it. Doing so retains a reference
+ * to a React-managed UIView that may be unmounted by RN's view tree at
+ * any moment (every cluster transition, every snapshot re-key, etc).
+ * When RN later releases the underlying UIView, GMSMarker's retained
+ * reference becomes a zombie pointer and we crash with:
+ *
+ *   "*** Terminating app due to uncaught exception ... view has been
+ *    unmounted from the React Native view hierarchy..."
+ *
+ * <p>Instead we rasterize the React-rendered UIView to a UIImage and
+ * assign it via {@code marker.icon}. This is the same pattern the classic
+ * marker pipeline uses and is the Google Maps Platform blog's official
+ * recommendation for the highest-performance Advanced Marker path
+ * (bitmaps composite at the GPU layer; iconViews trigger Auto Layout on
+ * every camera commit).
+ *
+ * <p>Caching: the rendered image is keyed by (markerId, view-identity,
+ * size). The common cluster-recompute case — same React snapshot view
+ * with the same size — hits the cache and the {@code marker.icon} setter
+ * sees the same UIImage instance, short-circuiting GMS's renderer commit.
  */
 - (void)setAdvancedMarkerView:(UIView *)markerView markerId:(NSString *)markerId
 {
   if (!markerView || markerId.length == 0) return;
+  // Retain the latest view so we can re-rasterize on demand if a marker
+  // is recreated. We never hand this pointer to GMS — see method docs.
   self.advancedIconViews[markerId] = markerView;
-  GMSAdvancedMarker *marker = (GMSAdvancedMarker *)self.advancedMarkersById[markerId];
-  if (marker && [marker respondsToSelector:@selector(setIconView:)]) {
-    marker.iconView = markerView;
+
+  CGSize size = markerView.bounds.size;
+  if (size.width <= 0 || size.height <= 0) {
+    // View hasn't been measured yet; React's onLayout will call us
+    // back once the snapshot view has settled.
+    return;
   }
+
+  GMSMarker *marker = self.advancedMarkersById[markerId];
+  if (!marker) return;
+
+  NSString *cacheKey = [NSString stringWithFormat:@"adv:%@:%p:%.0fx%.0f",
+                        markerId, (void *)markerView, size.width, size.height];
+  UIImage *cached = [self.viewBitmapCache objectForKey:cacheKey];
+  if (!cached) {
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
+    cached = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
+      [markerView drawViewHierarchyInRect:markerView.bounds afterScreenUpdates:YES];
+    }];
+    [self.viewBitmapCache setObject:cached forKey:cacheKey];
+  }
+  if (marker.icon == cached) {
+    // Identity check — same UIImage already on the marker. Skipping the
+    // setter here is the single biggest factor in keeping camera moves
+    // smooth: every -setIcon: triggers a GMS renderer commit.
+    return;
+  }
+  marker.icon = cached;
+  marker.groundAnchor = CGPointMake(0.5, 1);
+  // tracksViewChanges = NO so GMS doesn't try to redraw a UIView we've
+  // already rasterized into a UIImage.
+  marker.tracksViewChanges = NO;
 }
 
 /**

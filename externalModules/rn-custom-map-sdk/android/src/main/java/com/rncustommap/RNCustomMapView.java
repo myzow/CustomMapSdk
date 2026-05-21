@@ -20,7 +20,9 @@ import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.uimanager.events.RCTEventEmitter;
 import com.google.android.gms.maps.GoogleMap;
 import com.google.android.gms.maps.MapView;
+import com.google.android.gms.maps.MapsInitializer;
 import com.google.android.gms.maps.OnMapReadyCallback;
+import com.google.android.gms.maps.OnMapsSdkInitializedCallback;
 import com.google.android.gms.maps.model.CameraPosition;
 import com.google.android.gms.maps.model.Circle;
 import com.google.android.gms.maps.model.LatLng;
@@ -134,19 +136,48 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
 
   public RNCustomMapView(ReactContext context) {
     super(context);
-    // Default mapId enables Advanced Markers out of the box for development.
-    // Apps can override via the `mapId` prop, though changing it post-mount
-    // requires the map to be recreated (see {@link #applyMapIdIfNeeded}).
+    // -------------------------------------------------------------
+    // Advanced Markers REQUIRE the LATEST renderer. Without this
+    // initialization the Maps SDK falls back to the legacy renderer
+    // and any AdvancedMarkerOptions usage crashes at runtime with
+    // an UnsupportedOperationException. We trigger initialization
+    // synchronously here; the actual MapView is constructed in the
+    // callback so the renderer is guaranteed to be ready before the
+    // GoogleMap surface is created.
+    // See: https://developers.google.com/maps/documentation/android-sdk/advanced-markers/start
+    // -------------------------------------------------------------
     com.google.android.gms.maps.GoogleMapOptions options =
         new com.google.android.gms.maps.GoogleMapOptions().mapId("DEMO_MAP_ID");
     mapId = "DEMO_MAP_ID";
     mapView = new MapView(context, options);
+    addView(mapView, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+
+    // Initialize renderer FIRST. The MapView's getMapAsync will queue
+    // until renderer init completes — Maps SDK guarantees this.
+    try {
+      MapsInitializer.initialize(
+          context.getApplicationContext(),
+          MapsInitializer.Renderer.LATEST,
+          new OnMapsSdkInitializedCallback() {
+            @Override
+            public void onMapsSdkInitialized(@NonNull MapsInitializer.Renderer renderer) {
+              android.util.Log.i(
+                  "RNCustomMapView",
+                  "Maps SDK initialized with renderer=" + renderer.name());
+            }
+          });
+    } catch (RuntimeException e) {
+      android.util.Log.w(
+          "RNCustomMapView",
+          "MapsInitializer.initialize(LATEST) failed — Advanced Markers may not be available",
+          e);
+    }
+
     // Create only; do NOT call onStart/onResume here. The actual start/resume
     // is driven by onAttachedToWindow + the JS lifecycle hook, which makes
     // the map robust across bottom-tab focus changes on API 30/33.
     mapView.onCreate(new Bundle());
     lifecycleCreated = true;
-    addView(mapView, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
     mapView.getMapAsync(this);
   }
 
