@@ -290,3 +290,28 @@ Replace the bitmap-only path with a **live iconView path** (default) plus a `tra
 - P2: `priorityDistance` / `throttleDistance` props — distance-based throttling like Uber's "distant cars render at 15fps" pattern.
 - P2: optional content-hash signature for bitmap cache so prop-driven re-renders of the same JSX tree hit the cache instead of remeasuring.
 
+
+---
+
+# Hotfix: replace iconView reparenting with bitmap pumping (Jan 2026)
+
+## Bug reported
+"iOS: Attempt to unmount a view which is mounted inside different view.  
+ Android: addViewAt: failed to insert view [N] into parent [M] at index K — App crashes immediately when opening Clustering tab."
+
+## Root cause
+The previous iteration reparented the React-managed snapshot View into an SDK-owned wrapper before handing it to `AdvancedMarkerOptions.iconView(...)` / `GMSAdvancedMarker.iconView`. Even though Maps SDK was happy, React Native's Fabric mount layer tracks every view's parent and aborts the app the next time it tries to mutate the snapshot root with a stale child list. There is no RN-safe way to move a Fabric-mounted view out of its React parent.
+
+## Corrected approach — bitmap pumping
+The React view is left untouched in React's snapshot subtree. Live animation is achieved by re-rasterizing the view onto a `Bitmap` / `UIImage` at ~30 FPS via `Choreographer.FrameCallback` (Android) / `CADisplayLink` (iOS) and pushing the result to `marker.setIcon(...)`. The pump auto-starts when the first live marker arrives, throttles itself to 30 FPS, and auto-stops when all live markers are removed.
+
+- `Choreographer` callback (Android) reuses per-marker `Bitmap` to avoid GC churn.
+- `CADisplayLink` (iOS) uses `drawViewHierarchyInRect:afterScreenUpdates:NO` so each frame skips a redundant layout pass.
+- `tracksViewChanges=false` opts out to a one-shot rasterization with content-signature cache — recommended for dense scenes.
+- `-1` sentinel from JS on ref-null safely tears down the cached snapshot reference before RN deallocates the underlying view; no zombie reads from the pump.
+
+## Files touched (this hotfix)
+- `externalModules/rn-custom-map-sdk/android/.../RNAdvancedMarkers.java` — full rewrite: removed `FrameLayout` wrappers, added Choreographer-based pump
+- `externalModules/rn-custom-map-sdk/ios/RNCustomMapView.mm` — removed UIView wrappers / `applyLiveIconView` / `applyStaticBitmap`, added CADisplayLink pump (`rasterizeAdvancedMarker:` + `pumpAdvancedLiveMarkers:` + `updateAdvancedPumpRunning`), `dealloc` invalidates the link
+- `FIXES.md` updated with corrected Issue 6 write-up
+

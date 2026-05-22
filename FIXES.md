@@ -8,14 +8,22 @@ Google Maps `MapView` instances.
 
 ## Issue 6 — Animations frozen on `<AdvancedMarker>` children (Lottie, Animated.View, ActivityIndicator)
 
-**Root cause.** The previous fix used bitmap rasterization for `<AdvancedMarker>` children — it eliminated the crash but produced a single static snapshot of the React subtree. Anything that animated after first layout (pulsing dots, Lottie, ActivityIndicators, Reanimated transforms, rotating vehicle icons) appeared frozen.
+**Root cause #1 (frozen content).** The Issue 3/4 fix rasterized children to a static bitmap. Anything that animated after first layout — pulsing dots, Lottie, ActivityIndicators, Reanimated transforms, rotating vehicle icons — appeared frozen.
 
-**Fix.** Live `iconView` path — the same technique Uber / Lyft / Life360 / Zomato use under the hood.
+**Root cause #2 (the obvious fix crashes).** The obvious cure — call `parent.removeView(view); wrapper.addView(view)` to reparent the React snapshot view into an SDK-owned wrapper that GMS can attach as `iconView` — also crashes, but later and more loudly. React Native's Fabric mount layer tracks every view's parent and aborts the app the next time it tries to mutate the snapshot root with a stale child list:
 
-- **Android (`RNAdvancedMarkers.java`)**: each marker gets an SDK-owned `FrameLayout` wrapper. When the React snapshot view arrives via `setIconView`, it's removed from React's off-screen snapshot root and added to our wrapper (sidesteps the `IllegalStateException: child already has a parent` that the raw `iconView(reactView)` call produced). The wrapper is then handed to `AdvancedMarkerOptions.iconView(...)`. React-driven animations on the inner view continue ticking because the view is in a real native view hierarchy; GMS's overlay container recomposites the marker every time the wrapper invalidates.
-- **iOS (`RNCustomMapView.mm`)**: same wrapper pattern with a `UIView`. The wrapper is assigned to `GMSAdvancedMarker.iconView` with `tracksViewChanges = YES`, so GMS re-renders the marker on every wrapper redraw. Animated.View / Lottie / ActivityIndicator / Reanimated all play back at native frame rate.
-- **`tracksViewChanges` opt-out**: the new prop on `<AdvancedMarker>` (default `true`) lets dense scenes opt individual markers into the cached static-bitmap path for max FPS. The bitmap path is preserved with content-signature caching from Issue 3/4 so it still skips redundant `setIcon` calls.
-- **Unmount safety**: when React unmounts a snapshot view, the JS ref callback now dispatches a `-1` sentinel to `setAdvancedMarkerView`. Native detaches the React view from our wrapper and clears `marker.iconView` *before* RN deallocates the underlying view — eliminating the "view has been unmounted from the React Native view hierarchy" crash on the live path.
+```
+iOS:     "Attempt to unmount a view which is mounted inside different view."
+Android: "addViewAt: failed to insert view [N] into parent [M] at index K"
+```
+
+**Fix — bitmap pumping (the RN-safe live-animation path).** The React view is left exactly where React put it (the off-screen snapshot subtree) and we snapshot its visual content into a bitmap that GMS displays as the marker icon. For live animation we re-snapshot on a Choreographer / CADisplayLink tick.
+
+- **Android (`RNAdvancedMarkers.java`)**: a single per-view `Choreographer.FrameCallback` iterates the `liveMarkers` set every ~33ms (30 FPS throttle). For each id, the React snapshot view's current visual is captured via `View.draw(Canvas)` into a per-marker reusable `Bitmap`, wrapped in a fresh `BitmapDescriptor`, and pushed to the marker via `setIcon`. The pump auto-starts when the first live marker arrives and auto-stops when the last is removed.
+- **iOS (`RNCustomMapView.mm`)**: same design with `CADisplayLink` throttled to 30 FPS (`preferredFrameRateRange = (15, 30, 30)`). Each tick calls `drawViewHierarchyInRect:afterScreenUpdates:NO` on the React UIView and assigns the resulting UIImage to `marker.icon`. `afterScreenUpdates:NO` skips an unnecessary layout pass per frame — critical for the FPS target.
+- **`tracksViewChanges` (boolean, default `true`)**: opt out to the cached static-bitmap path with content-signature dedup (one rasterization, reused forever). Recommended for dense scenes (500+ markers) where individual markers don't animate.
+- **Unmount safety**: JS dispatches a `-1` sentinel to `setAdvancedMarkerView` when React's ref returns null. Native drops the cached snapshot reference before RN deallocates the UIView/View, so the pump never tries to draw against a zombie pointer.
+- **No reparenting of React views — at all.** RN-Fabric-safe by construction. Animations that drive view state (Animated.View with any driver, Lottie, ActivityIndicator, Reanimated layout/style props) capture correctly because `View.draw(canvas)` / `drawViewHierarchyInRect:` read the View's current render-server state.
 
 
 ---

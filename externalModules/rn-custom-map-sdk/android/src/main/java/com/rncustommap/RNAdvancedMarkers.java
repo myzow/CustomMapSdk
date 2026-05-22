@@ -4,9 +4,8 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.view.Choreographer;
 import android.view.View;
-import android.view.ViewGroup;
-import android.widget.FrameLayout;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -35,54 +34,52 @@ import java.util.Set;
 /**
  * Native pipeline that backs the JS-side {@code <AdvancedMarker>} component.
  *
- * <h2>Two rendering modes</h2>
+ * <h2>Why bitmap-pumping (and not live iconView reparenting)</h2>
+ *
+ * <p>Google Maps' {@code AdvancedMarkerOptions.iconView(view)} only works
+ * when the supplied View has no parent. The React-rendered snapshot view
+ * is parented inside React Native's snapshot subtree, so naively passing
+ * it to GMS triggers {@code IllegalStateException}. The "obvious" fix —
+ * call {@code parent.removeView(view); wrapper.addView(view)} to reparent
+ * the view into an SDK-owned wrapper — also crashes, but later and more
+ * loudly: React Native's Fabric mount layer tracks every view's parent
+ * and aborts the app the next time it tries to mutate the snapshot root
+ * with a stale child list:
+ *
+ * <pre>
+ * // iOS
+ * "Attempt to unmount a view which is mounted inside different view."
+ *
+ * // Android
+ * "addViewAt: failed to insert view [N] into parent [M] at index K"
+ * </pre>
+ *
+ * <p>The only RN-safe option is to leave the React View exactly where
+ * React put it and snapshot its visual content into a bitmap that GMS
+ * displays as the marker icon. For live animation we re-snapshot on a
+ * {@link Choreographer} tick (30 FPS by default — high enough to feel
+ * smooth, low enough to keep texture upload bandwidth in check).
+ *
+ * <h2>Two modes</h2>
  *
  * <ol>
- *   <li><b>Live iconView</b> (default, {@code tracksViewChanges=true}).
- *       The React-rendered View is reparented into an SDK-owned
- *       {@link FrameLayout} wrapper and the wrapper is passed to
- *       {@link AdvancedMarkerOptions#iconView(View)}. The wrapper becomes a
- *       real child of the {@code GoogleMap} overlay container, so any
- *       animation the View runs (Animated.View, Lottie, ActivityIndicator,
- *       Reanimated, rotating image) plays back at native frame rate. This
- *       is the path Uber / Lyft / Life360 / Zomato use for live driver pins,
- *       courier pulses, and breathing destination dots.</li>
- *
- *   <li><b>Static bitmap</b> ({@code tracksViewChanges=false}). The View
- *       is rasterized via {@link View#draw(Canvas)} once per content
- *       signature and the resulting {@link BitmapDescriptor} is reused
- *       across cluster recomputes. This is the highest-FPS path; use it
- *       for dense maps (500+ markers) where the marker's visual content
- *       does not change after first layout.</li>
+ *   <li><b>Live</b> ({@code tracksViewChanges=true}, default). A single
+ *       per-view Choreographer pump iterates {@link State#liveMarkers}
+ *       each frame, calls {@link View#draw(Canvas)} on the snapshot
+ *       view, and pushes the bitmap to the marker. Animated.View, Lottie,
+ *       ActivityIndicator, Reanimated transforms — anything that
+ *       repaints itself — animates on the marker because the
+ *       re-rasterization captures whatever state the View is in at
+ *       that frame.</li>
+ *   <li><b>Static</b> ({@code tracksViewChanges=false}). One snapshot
+ *       at first layout, cached by content signature, no pump. Highest
+ *       FPS path; recommended for dense maps (500+ markers).</li>
  * </ol>
- *
- * <h2>Why the wrapper</h2>
- *
- * <p>{@code AdvancedMarkerOptions.iconView(view)} crashes with
- * {@code IllegalStateException} when the supplied View already has a
- * parent. React Native's snapshot tree always parents the rendered view
- * (under the off-screen {@code markerSnapshotRoot}), so we cannot pass
- * React's View directly. Instead we keep a dedicated FrameLayout per
- * marker id, move the React View into it (removing from the snapshot
- * root first), and hand the wrapper to Maps SDK. GMS adds the wrapper
- * to its overlay container; the React View animates inside as a normal
- * child.
- *
- * <p>Edge cases handled:
- * <ul>
- *   <li>React unmounts the snapshot view → JS calls {@link #releaseIconView}
- *       which detaches the React View from our wrapper and clears the
- *       marker's icon. Prevents the "view has been unmounted" crash.</li>
- *   <li>Marker is removed (cluster forms / scrolled off / id disappears)
- *       → {@code removeMarker} cleans the wrapper and clears the iconView
- *       reference.</li>
- *   <li>Content swap (same marker id, new React snapshot view) → wrapper
- *       is repurposed: old child removed, new child added. The
- *       AdvancedMarker itself is reused (its iconView reference is still
- *       the same wrapper instance).</li>
- * </ul>
  */
 public final class RNAdvancedMarkers {
+
+  /** Minimum nanoseconds between live re-snapshots (~30 FPS). */
+  private static final long PUMP_INTERVAL_NS = 33_000_000L;
 
   /** Cluster item kept for ClusterManager compatibility. Not used for rendering. */
   static final class RNAdvancedClusterItem implements ClusterItem {
@@ -103,8 +100,7 @@ public final class RNAdvancedMarkers {
   /**
    * Custom renderer that disables auto-clustering. JS performs clustering
    * and pushes singletons + synthetic bubbles to the native side; this
-   * renderer keeps the {@link ClusterManager} API surface available
-   * without re-merging anything.
+   * renderer keeps the {@link ClusterManager} API surface available.
    */
   static final class AdvancedRenderer
       extends DefaultClusterRenderer<RNAdvancedClusterItem> {
@@ -114,27 +110,23 @@ public final class RNAdvancedMarkers {
     }
   }
 
-  /** Per-view state for the advanced-marker pipeline. */
+  /** Per-view state. */
   static final class State {
     @Nullable ClusterManager<RNAdvancedClusterItem> clusterManager;
     @Nullable AdvancedRenderer renderer;
     @Nullable MarkerManager.Collection collection;
-    /** Currently mounted advanced markers keyed by id. */
     final Map<String, Marker> markers = new HashMap<>();
-    /** Latest React-rendered iconView reference per marker id. */
     final Map<String, View> iconViews = new HashMap<>();
-    /** SDK-owned wrapper that holds the React iconView. One per marker id. */
-    final Map<String, FrameLayout> iconWrappers = new HashMap<>();
-    /** Marker ids whose AdvancedMarker was constructed with iconView (live mode). */
+    /** Markers participating in the live pump (have {@code tracksViewChanges=true}). */
     final Set<String> liveMarkers = new HashSet<>();
-    /** Marker ids using the static-bitmap path. */
-    final Set<String> staticMarkers = new HashSet<>();
-    /** Whether each marker prefers the live path (from tracksViewChanges). */
     final Map<String, Boolean> tracksChanges = new HashMap<>();
-    /** Cached bitmap descriptor per marker id (static path). */
-    final Map<String, BitmapDescriptor> lastIcons = new HashMap<>();
-    /** Content signature for the static-bitmap cache. */
     final Map<String, String> lastSignatures = new HashMap<>();
+    /** Per-marker reusable bitmap for the live pump. */
+    final Map<String, Bitmap> pumpBitmaps = new HashMap<>();
+    /** Single per-view Choreographer callback that pumps all live markers. */
+    @Nullable Choreographer.FrameCallback pumpCallback;
+    boolean pumpRunning;
+    long lastPumpTimeNs;
     boolean usingClusterManager = true;
   }
 
@@ -181,12 +173,8 @@ public final class RNAdvancedMarkers {
 
   /**
    * Apply a new set of advanced markers. Diff-based: existing markers
-   * are reused (position + light fields updated) when ids match,
-   * removed when ids disappear, created otherwise.
-   *
-   * <p>Icon binding (live iconView or static bitmap) is exclusively the
-   * job of {@link #setIconView}. This method never touches a marker's
-   * visual content — it only manipulates the marker set membership.
+   * reused, removed when ids disappear, created otherwise. Never touches
+   * marker visual content — {@link #setIconView} owns that.
    */
   static void setAdvancedMarkers(
       @NonNull RNCustomMapView view,
@@ -212,7 +200,6 @@ public final class RNAdvancedMarkers {
         }
       }
 
-      // 1) Remove obsolete markers.
       List<String> remove = new ArrayList<>();
       for (String existingId : state.markers.keySet()) {
         if (!incoming.containsKey(existingId)) remove.add(existingId);
@@ -221,7 +208,6 @@ public final class RNAdvancedMarkers {
         removeMarker(state, id);
       }
 
-      // 2) Add / update.
       for (String id : order) {
         ReadableMap item = incoming.get(id);
         LatLng pos = new LatLng(item.getDouble("latitude"), item.getDouble("longitude"));
@@ -232,9 +218,6 @@ public final class RNAdvancedMarkers {
         Marker existing = state.markers.get(id);
 
         if (existing != null) {
-          // Reuse: update mutable fields only. Icon binding is handled
-          // by setIconView (live) or the bitmap path inside setIconView
-          // (static).
           if (!existing.getPosition().equals(pos)) existing.setPosition(pos);
           String title = getString(item, "title");
           if (title != null && !title.equals(existing.getTitle())) existing.setTitle(title);
@@ -248,12 +231,13 @@ public final class RNAdvancedMarkers {
           if (alpha != existing.getAlpha()) existing.setAlpha(alpha);
           existing.setAnchor(anchorU(item), anchorV(item));
           existing.setZIndex((int) getDouble(item, "zIndex", existing.getZIndex()));
+          // Live-pump membership may have toggled.
+          if (tracksChanges) state.liveMarkers.add(id);
+          else state.liveMarkers.remove(id);
+          updatePumpRunning(view, state);
           continue;
         }
 
-        // Fresh marker. We always create with a transparent placeholder
-        // for custom-view markers — setIconView will swap in the real
-        // wrapper / bitmap once the React view has measured.
         BitmapDescriptor initialIcon =
             hasCustomView ? transparentPlaceholder() : null;
 
@@ -278,37 +262,24 @@ public final class RNAdvancedMarkers {
           created.setTag(id);
           state.markers.put(id, created);
 
-          // If a React snapshot view already arrived for this marker
-          // (setIconView called before setAdvancedMarkers due to UI-thread
-          // queue ordering), apply it now so the user never sees the
-          // transparent placeholder.
+          // If the snapshot view already arrived (queue ordering), apply
+          // it now so the placeholder doesn't flash.
           View cachedView = state.iconViews.get(id);
           if (hasCustomView && cachedView != null
               && cachedView.getWidth() > 0 && cachedView.getHeight() > 0) {
-            boolean liveMode = tracksChanges;
-            if (liveMode) {
-              applyLiveIconView(view, state, id, cachedView);
-            } else {
-              applyStaticBitmap(state, id, cachedView,
-                  cachedView.getWidth(), cachedView.getHeight());
-            }
+            applyIconView(view, state, id, cachedView, tracksChanges);
           }
         }
       }
+
+      updatePumpRunning(view, state);
     });
   }
 
   /**
-   * Bind a React-rendered native view as the visual for an advanced
-   * marker. Routes through one of two paths based on the marker's
-   * {@code tracksViewChanges} setting:
-   *
-   * <ul>
-   *   <li>{@code tracksViewChanges=true} (default): live iconView via
-   *       SDK-owned wrapper FrameLayout — animations play in real time.</li>
-   *   <li>{@code tracksViewChanges=false}: static bitmap snapshot —
-   *       fastest possible composition.</li>
-   * </ul>
+   * Bind a React-rendered native view as the visual for an advanced marker.
+   * Always uses the bitmap path — the View is never reparented out of
+   * React's view tree (doing so crashes RN's Fabric mount layer).
    */
   static void setIconView(
       @NonNull RNCustomMapView view, @NonNull String markerId, @NonNull View reactView) {
@@ -318,229 +289,191 @@ public final class RNAdvancedMarkers {
 
       int width = reactView.getWidth();
       int height = reactView.getHeight();
-      if (width <= 0 || height <= 0) {
-        // View hasn't been measured yet; React will call us again
-        // after onLayout settles.
-        return;
-      }
+      if (width <= 0 || height <= 0) return;
 
       state.iconViews.put(markerId, reactView);
 
       Boolean tracks = state.tracksChanges.get(markerId);
-      boolean liveMode = tracks == null || tracks;
-
-      if (liveMode) {
-        applyLiveIconView(view, state, markerId, reactView);
-      } else {
-        applyStaticBitmap(state, markerId, reactView, width, height);
-      }
+      boolean tracksChanges = tracks == null || tracks;
+      applyIconView(view, state, markerId, reactView, tracksChanges);
     });
   }
 
   /**
-   * Live-mode binding. Reparents the React View into our wrapper and
-   * (on first call) recreates the AdvancedMarker with the wrapper as
-   * iconView. Subsequent calls for the same marker just swap the
-   * wrapper's child — no marker recreation, no flicker.
+   * Common entry point for both modes. {@code tracksViewChanges=true}
+   * registers the marker into the live pump (and does an immediate
+   * one-shot rasterization so the user sees content before the next
+   * pump tick); {@code false} rasterizes once with a content-signature
+   * cache and stays put.
    */
-  private static void applyLiveIconView(
+  private static void applyIconView(
       @NonNull RNCustomMapView view,
       @NonNull State state,
       @NonNull String markerId,
-      @NonNull View reactView) {
-    FrameLayout wrapper = state.iconWrappers.get(markerId);
-    if (wrapper == null) {
-      wrapper = new FrameLayout(view.getContext());
-      wrapper.setLayoutParams(new ViewGroup.LayoutParams(
-          ViewGroup.LayoutParams.WRAP_CONTENT,
-          ViewGroup.LayoutParams.WRAP_CONTENT));
-      state.iconWrappers.put(markerId, wrapper);
-    }
+      @NonNull View reactView,
+      boolean tracksChanges) {
+    Marker marker = state.markers.get(markerId);
+    if (marker == null) return;
+    int width = reactView.getWidth();
+    int height = reactView.getHeight();
+    if (width <= 0 || height <= 0) return;
 
-    // Reparent the React View into our wrapper, if not already there.
-    if (reactView.getParent() != wrapper) {
-      ViewGroup oldParent = (ViewGroup) reactView.getParent();
-      if (oldParent != null) {
-        try {
-          oldParent.removeView(reactView);
-        } catch (RuntimeException e) {
-          android.util.Log.w("RNAdvancedMarkers",
-              "removeView from old parent failed for " + markerId, e);
-        }
-      }
-      // Clear any previous child (handles content swap on same id).
-      if (wrapper.getChildCount() > 0) {
-        wrapper.removeAllViews();
-      }
-      try {
-        wrapper.addView(reactView, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT));
-      } catch (IllegalStateException e) {
-        // Race: another parent grabbed the view between removeView and
-        // addView. Drop and let the next call retry.
-        android.util.Log.w("RNAdvancedMarkers",
-            "addView to wrapper failed for " + markerId, e);
-        return;
-      }
-    }
+    // Always do an immediate rasterization (so the placeholder
+    // disappears within the same frame the snapshot view mounts).
+    rasterizeOnce(state, markerId, reactView, marker, width, height,
+        /*useSignatureCache=*/ !tracksChanges);
 
-    if (state.liveMarkers.contains(markerId)) {
-      // Marker already wired with this wrapper — animations are
-      // already running, nothing else to do. Wrapper redraws itself
-      // when its child invalidates (Animated.View / Lottie / etc).
-      return;
-    }
-
-    Marker existing = state.markers.get(markerId);
-    if (existing == null) return;
-
-    // Preserve current marker fields.
-    LatLng pos = existing.getPosition();
-    String title = existing.getTitle();
-    String snippet = existing.getSnippet();
-    boolean draggable = existing.isDraggable();
-    boolean flat = existing.isFlat();
-    float rotation = existing.getRotation();
-    float alpha = existing.getAlpha();
-    float zIndex = existing.getZIndex();
-
-    if (state.collection != null) state.collection.remove(existing);
-    state.markers.remove(markerId);
-
-    AdvancedMarkerOptions options = new AdvancedMarkerOptions()
-        .position(pos)
-        .title(title)
-        .snippet(snippet)
-        .draggable(draggable)
-        .flat(flat)
-        .rotation(rotation)
-        .alpha(alpha)
-        .anchor(0.5f, 1f)
-        .zIndex((int) zIndex)
-        .iconView(wrapper);
-
-    Marker created;
-    try {
-      created = state.collection.addMarker(options);
-    } catch (RuntimeException e) {
-      android.util.Log.e("RNAdvancedMarkers",
-          "addMarker with iconView failed for " + markerId, e);
-      // Fall back to static bitmap so the user at least sees something.
-      applyStaticBitmap(state, markerId, reactView,
-          reactView.getWidth(), reactView.getHeight());
-      return;
-    }
-    if (created != null) {
-      created.setTag(markerId);
-      state.markers.put(markerId, created);
+    if (tracksChanges) {
       state.liveMarkers.add(markerId);
-      state.staticMarkers.remove(markerId);
+      updatePumpRunning(view, state);
+    } else {
+      state.liveMarkers.remove(markerId);
+      updatePumpRunning(view, state);
     }
   }
 
   /**
-   * Static-bitmap binding. Rasterizes the React View via View.draw and
-   * uses the bitmap as the marker's icon. Cached by content signature
-   * so cluster recomputes are no-ops.
+   * One-shot rasterization. Uses a reusable {@link Bitmap} keyed by
+   * markerId so the live pump path avoids per-frame allocations.
+   *
+   * @param useSignatureCache when true, skip the rasterization if the
+   *     (view-identity, width, height) signature matches the last one
+   *     applied — used by the static path so cluster recomputes are
+   *     no-ops.
    */
-  private static void applyStaticBitmap(
+  private static void rasterizeOnce(
       @NonNull State state,
       @NonNull String markerId,
       @NonNull View reactView,
+      @NonNull Marker marker,
       int width,
-      int height) {
-    String signature = signatureFor(markerId, reactView, width, height);
-    if (signature.equals(state.lastSignatures.get(markerId))
-        && state.staticMarkers.contains(markerId)) {
-      return; // unchanged
-    }
-
-    BitmapDescriptor descriptor;
-    try {
-      Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
-      Canvas canvas = new Canvas(bitmap);
-      reactView.draw(canvas);
-      descriptor = BitmapDescriptorFactory.fromBitmap(bitmap);
-    } catch (RuntimeException e) {
-      android.util.Log.e("RNAdvancedMarkers",
-          "rasterize failed for " + markerId, e);
+      int height,
+      boolean useSignatureCache) {
+    String signature = markerId + ":" + System.identityHashCode(reactView)
+        + ":" + width + "x" + height;
+    if (useSignatureCache && signature.equals(state.lastSignatures.get(markerId))) {
       return;
     }
 
-    Marker existing = state.markers.get(markerId);
-    if (existing == null) return;
-
-    // If the marker was previously in live mode, we need to recreate
-    // it without iconView (the AdvancedMarker SDK doesn't let you
-    // un-set an iconView in place — bitmap and iconView are mutually
-    // exclusive at construction).
-    if (state.liveMarkers.contains(markerId)) {
-      LatLng pos = existing.getPosition();
-      String title = existing.getTitle();
-      String snippet = existing.getSnippet();
-      if (state.collection != null) state.collection.remove(existing);
-      state.markers.remove(markerId);
-      detachWrapperChild(state, markerId);
-
-      AdvancedMarkerOptions options = new AdvancedMarkerOptions()
-          .position(pos)
-          .title(title)
-          .snippet(snippet)
-          .anchor(0.5f, 1f)
-          .icon(descriptor);
-      Marker created = state.collection.addMarker(options);
-      if (created != null) {
-        created.setTag(markerId);
-        state.markers.put(markerId, created);
+    Bitmap bmp = state.pumpBitmaps.get(markerId);
+    if (bmp == null || bmp.isRecycled()
+        || bmp.getWidth() != width || bmp.getHeight() != height) {
+      if (bmp != null && !bmp.isRecycled()) bmp.recycle();
+      try {
+        bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+      } catch (OutOfMemoryError e) {
+        android.util.Log.e("RNAdvancedMarkers",
+            "Bitmap.createBitmap OOM for " + markerId, e);
+        return;
       }
-      state.liveMarkers.remove(markerId);
+      state.pumpBitmaps.put(markerId, bmp);
     } else {
-      existing.setIcon(descriptor);
-      existing.setAnchor(0.5f, 1f);
+      bmp.eraseColor(Color.TRANSPARENT);
     }
 
-    state.staticMarkers.add(markerId);
-    state.lastIcons.put(markerId, descriptor);
+    try {
+      reactView.draw(new Canvas(bmp));
+    } catch (RuntimeException e) {
+      android.util.Log.w("RNAdvancedMarkers",
+          "draw failed for " + markerId, e);
+      return;
+    }
+
+    try {
+      marker.setIcon(BitmapDescriptorFactory.fromBitmap(bmp));
+      marker.setAnchor(0.5f, 1f);
+    } catch (RuntimeException e) {
+      android.util.Log.w("RNAdvancedMarkers",
+          "setIcon failed for " + markerId, e);
+      return;
+    }
     state.lastSignatures.put(markerId, signature);
   }
 
   /**
-   * Release the live iconView for a marker. Called from JS when React
-   * unmounts the snapshot view (ref callback receives null) so we can
-   * detach the React View BEFORE it's deallocated by RN — prevents the
-   * unmounting crash and lets GMS clean up its overlay reference.
+   * Start or stop the per-view Choreographer pump based on whether any
+   * markers want live updates. A single callback iterates all live
+   * markers — much cheaper than one callback per marker, and naturally
+   * coalesces work into one composite per frame.
+   */
+  private static void updatePumpRunning(
+      @NonNull RNCustomMapView view, @NonNull State state) {
+    boolean shouldRun = !state.liveMarkers.isEmpty();
+    if (shouldRun && !state.pumpRunning) {
+      state.pumpRunning = true;
+      state.lastPumpTimeNs = 0;
+      startPump(view, state);
+    } else if (!shouldRun && state.pumpRunning) {
+      state.pumpRunning = false;
+      // The callback re-posts itself only when pumpRunning is true, so
+      // it naturally drains. We don't need to remove it explicitly.
+    }
+  }
+
+  private static void startPump(
+      @NonNull RNCustomMapView view, @NonNull State state) {
+    final Choreographer choreographer;
+    try {
+      choreographer = Choreographer.getInstance();
+    } catch (IllegalStateException e) {
+      // Not on a UI thread with a Looper — shouldn't happen because
+      // whenReady() runs on the UI thread.
+      android.util.Log.e("RNAdvancedMarkers", "no Choreographer", e);
+      state.pumpRunning = false;
+      return;
+    }
+
+    Choreographer.FrameCallback callback = new Choreographer.FrameCallback() {
+      @Override
+      public void doFrame(long frameTimeNanos) {
+        if (!state.pumpRunning) return;
+        choreographer.postFrameCallback(this);
+
+        if (state.lastPumpTimeNs != 0
+            && frameTimeNanos - state.lastPumpTimeNs < PUMP_INTERVAL_NS) {
+          return; // throttle to ~30 FPS
+        }
+        state.lastPumpTimeNs = frameTimeNanos;
+
+        // Snapshot of live markers (copy because the live pump may
+        // remove ids if a rasterization fails).
+        List<String> ids = new ArrayList<>(state.liveMarkers);
+        for (String id : ids) {
+          View src = state.iconViews.get(id);
+          Marker marker = state.markers.get(id);
+          if (src == null || marker == null) continue;
+          int w = src.getWidth();
+          int h = src.getHeight();
+          if (w <= 0 || h <= 0) continue;
+          rasterizeOnce(state, id, src, marker, w, h, /*useSignatureCache=*/ false);
+        }
+      }
+    };
+    state.pumpCallback = callback;
+    choreographer.postFrameCallback(callback);
+  }
+
+  /**
+   * Release the live binding for a marker — called from JS when React
+   * unmounts the snapshot view (ref callback returns null). Removes the
+   * marker from the live pump and clears the cached snapshot reference
+   * so we never try to {@link View#draw(Canvas)} on a deallocated view.
    */
   static void releaseIconView(@NonNull RNCustomMapView view, @NonNull String markerId) {
     view.whenReady(() -> {
       State state = view.advancedState;
       state.iconViews.remove(markerId);
-      detachWrapperChild(state, markerId);
-      // Replace the marker's iconView with a transparent placeholder so
-      // GMS doesn't hold a reference to the (now-empty) wrapper. The
-      // marker itself stays — JS may push a new snapshot view shortly.
+      state.liveMarkers.remove(markerId);
+      state.lastSignatures.remove(markerId);
+      Bitmap bmp = state.pumpBitmaps.remove(markerId);
+      if (bmp != null && !bmp.isRecycled()) bmp.recycle();
       Marker marker = state.markers.get(markerId);
-      if (marker != null && state.liveMarkers.contains(markerId)) {
-        // We can't swap iconView in place; recreate with bitmap.
-        LatLng pos = marker.getPosition();
-        String title = marker.getTitle();
-        String snippet = marker.getSnippet();
-        if (state.collection != null) state.collection.remove(marker);
-        state.markers.remove(markerId);
-        state.liveMarkers.remove(markerId);
-
-        AdvancedMarkerOptions options = new AdvancedMarkerOptions()
-            .position(pos)
-            .title(title)
-            .snippet(snippet)
-            .anchor(0.5f, 1f)
-            .icon(transparentPlaceholder());
-        Marker recreated = state.collection.addMarker(options);
-        if (recreated != null) {
-          recreated.setTag(markerId);
-          state.markers.put(markerId, recreated);
-        }
+      if (marker != null) {
+        try {
+          marker.setIcon(transparentPlaceholder());
+        } catch (RuntimeException ignored) {}
       }
+      updatePumpRunning(view, state);
     });
   }
 
@@ -551,32 +484,12 @@ public final class RNAdvancedMarkers {
   private static void removeMarker(@NonNull State state, @NonNull String markerId) {
     Marker m = state.markers.remove(markerId);
     if (m != null && state.collection != null) state.collection.remove(m);
-    detachWrapperChild(state, markerId);
-    state.iconWrappers.remove(markerId);
     state.iconViews.remove(markerId);
     state.liveMarkers.remove(markerId);
-    state.staticMarkers.remove(markerId);
-    state.lastIcons.remove(markerId);
     state.lastSignatures.remove(markerId);
     state.tracksChanges.remove(markerId);
-  }
-
-  private static void detachWrapperChild(@NonNull State state, @NonNull String markerId) {
-    FrameLayout wrapper = state.iconWrappers.get(markerId);
-    if (wrapper != null && wrapper.getChildCount() > 0) {
-      try {
-        wrapper.removeAllViews();
-      } catch (RuntimeException e) {
-        android.util.Log.w("RNAdvancedMarkers",
-            "wrapper.removeAllViews failed for " + markerId, e);
-      }
-    }
-  }
-
-  @NonNull
-  private static String signatureFor(
-      @NonNull String markerId, @NonNull View view, int width, int height) {
-    return markerId + ":" + System.identityHashCode(view) + ":" + width + "x" + height;
+    Bitmap bmp = state.pumpBitmaps.remove(markerId);
+    if (bmp != null && !bmp.isRecycled()) bmp.recycle();
   }
 
   @NonNull

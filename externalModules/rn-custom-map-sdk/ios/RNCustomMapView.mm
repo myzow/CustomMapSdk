@@ -18,15 +18,18 @@ using namespace facebook::react;
 /** Latest React-rendered iconView UIView for each advanced marker id. */
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *advancedIconViews;
 /**
- * SDK-owned UIView wrapper per advanced marker id. We never hand the
- * React-managed UIView directly to GMS — instead it's reparented into
- * this wrapper and the wrapper is assigned to GMSAdvancedMarker.iconView.
- * Lets us cleanly detach on unmount before RN deallocates the underlying
- * view (prevents the "view has been unmounted" crash).
+ * Set of marker ids that want live (re-rasterized every pump tick)
+ * updates. Membership is driven by the {@code tracksViewChanges} prop.
  */
-@property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *advancedIconWrappers;
+@property (nonatomic, strong) NSMutableSet<NSString *> *advancedLiveMarkers;
 /** Per-marker tracksViewChanges preference (default YES if absent). */
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *advancedTracksChanges;
+/**
+ * Single CADisplayLink that drives the live-marker rasterization pump.
+ * Allocated lazily when the first live marker arrives, invalidated when
+ * the last live marker is removed. Throttled to ~30 FPS.
+ */
+@property (nonatomic, strong, nullable) CADisplayLink *advancedPumpLink;
 /** GMUClusterManager kept for spec-compliance and cross-platform parity. */
 @property (nonatomic, strong, nullable) id clusterManager;
 @property (nonatomic, copy, nullable) NSString *currentMapId;
@@ -52,7 +55,7 @@ using namespace facebook::react;
     _markersById = [NSMutableDictionary new];
     _advancedMarkersById = [NSMutableDictionary new];
     _advancedIconViews = [NSMutableDictionary new];
-    _advancedIconWrappers = [NSMutableDictionary new];
+    _advancedLiveMarkers = [NSMutableSet new];
     _advancedTracksChanges = [NSMutableDictionary new];
     _currentMapId = @"DEMO_MAP_ID";
     _mapPolylines = [NSMutableArray new];
@@ -112,6 +115,8 @@ using namespace facebook::react;
 - (void)dealloc
 {
   [[NSNotificationCenter defaultCenter] removeObserver:self];
+  [_advancedPumpLink invalidate];
+  _advancedPumpLink = nil;
 }
 
 - (void)handleMemoryWarning
@@ -345,17 +350,12 @@ using namespace facebook::react;
       m.iconView = nil;
       m.map = nil;
     }
-    UIView *wrapper = self.advancedIconWrappers[removedId];
-    if (wrapper) {
-      for (UIView *sub in [wrapper.subviews copy]) {
-        [sub removeFromSuperview];
-      }
-    }
     [self.advancedMarkersById removeObjectForKey:removedId];
-    [self.advancedIconWrappers removeObjectForKey:removedId];
     [self.advancedIconViews removeObjectForKey:removedId];
+    [self.advancedLiveMarkers removeObject:removedId];
     [self.advancedTracksChanges removeObjectForKey:removedId];
   }
+  [self updateAdvancedPumpRunning];
 
   // 2) Add / update.
   for (NSString *identifier in order) {
@@ -452,47 +452,44 @@ using namespace facebook::react;
 /**
  * Bind a React-rendered native view as the visual for an advanced marker.
  *
- * <p>Two paths:
+ * <p>The View is NEVER reparented out of React's view tree — doing so
+ * crashes React Native's Fabric mount layer with "Attempt to unmount a
+ * view which is mounted inside different view." Instead the View is
+ * left exactly where React put it (the off-screen snapshot subtree) and
+ * we snapshot its visual content into a UIImage that GMS displays as
+ * the marker icon.
+ *
+ * <p>Two modes:
  * <ul>
- *   <li><b>Live iconView</b> (default, {@code tracksViewChanges=YES}) —
- *       the React UIView is moved into an SDK-owned wrapper UIView and
- *       the wrapper is assigned to {@code GMSAdvancedMarker.iconView}.
- *       With {@code tracksViewChanges=YES}, GMS re-renders the marker
- *       whenever the wrapper redraws, so Animated.View, Lottie, Reanimated
- *       and ActivityIndicator all play back in real time — the same
- *       approach Uber/Lyft/Life360/Zomato use for live driver pins.</li>
- *   <li><b>Static bitmap</b> ({@code tracksViewChanges=NO}) — the UIView
- *       is rasterized to a UIImage and assigned to {@code marker.icon}.
- *       Fastest path; use for dense maps where content doesn't animate.</li>
+ *   <li><b>Live</b> ({@code tracksViewChanges=YES}, default). The marker
+ *       is added to {@code advancedLiveMarkers} and a single per-view
+ *       CADisplayLink pump re-snapshots all live markers at ~30 FPS.
+ *       Animated.View, Lottie, ActivityIndicator, Reanimated transforms
+ *       — anything that repaints itself — appears live on the marker.</li>
+ *   <li><b>Static</b> ({@code tracksViewChanges=NO}). One snapshot at
+ *       first layout, cached by content signature, no pump. Highest FPS
+ *       path; recommended for 500+ marker scenes.</li>
  * </ul>
  *
  * <p>A {@code markerView} of nil is the release sentinel — invoked by
- * JS when React unmounts the snapshot view. We detach the React UIView
- * from our wrapper and clear {@code marker.iconView} BEFORE RN
- * deallocates the underlying view. This prevents the "view has been
- * unmounted from the React Native view hierarchy" crash that the
- * previous iconView implementation produced.
+ * JS when React unmounts the snapshot view. We drop the cached reference
+ * BEFORE RN deallocates the underlying UIView so the pump never tries
+ * to render against a zombie pointer.
  */
 - (void)setAdvancedMarkerView:(UIView *)markerView markerId:(NSString *)markerId
 {
   if (markerId.length == 0) return;
 
-  // Release path — React just unmounted the snapshot view. Detach our
-  // strong reference before RN deallocates the UIView underneath us.
+  // Release path — React just unmounted the snapshot view.
   if (!markerView) {
-    UIView *wrapper = self.advancedIconWrappers[markerId];
-    if (wrapper) {
-      for (UIView *sub in [wrapper.subviews copy]) {
-        [sub removeFromSuperview];
-      }
-    }
+    [self.advancedIconViews removeObjectForKey:markerId];
+    [self.advancedLiveMarkers removeObject:markerId];
     GMSAdvancedMarker *marker = (GMSAdvancedMarker *)self.advancedMarkersById[markerId];
     if (marker) {
-      marker.iconView = nil;
       marker.icon = [self transparentPlaceholderImage];
       marker.tracksViewChanges = NO;
     }
-    [self.advancedIconViews removeObjectForKey:markerId];
+    [self updateAdvancedPumpRunning];
     return;
   }
 
@@ -509,80 +506,102 @@ using namespace facebook::react;
   NSNumber *tracksBoxed = self.advancedTracksChanges[markerId];
   BOOL tracksChanges = tracksBoxed ? tracksBoxed.boolValue : YES;
 
+  // Immediate one-shot snapshot — fills in the placeholder this frame.
+  [self rasterizeAdvancedMarker:markerId
+                          source:markerView
+                          marker:marker
+              useSignatureCache:!tracksChanges];
+
   if (tracksChanges) {
-    [self applyLiveIconView:markerView markerId:markerId marker:marker];
+    [self.advancedLiveMarkers addObject:markerId];
   } else {
-    [self applyStaticBitmap:markerView markerId:markerId marker:marker size:size];
+    [self.advancedLiveMarkers removeObject:markerId];
   }
+  [self updateAdvancedPumpRunning];
 }
 
 /**
- * Live-mode binding. Reparents the React UIView into our SDK-owned
- * wrapper and assigns the wrapper as {@code marker.iconView} with
- * {@code tracksViewChanges=YES}. The animation timeline runs on the
- * React UIView (it stays in a real view hierarchy, so Animated/Lottie/
- * Reanimated all keep ticking); GMS re-renders the marker each frame
- * the wrapper redraws.
+ * One-shot rasterization. Cached UIImage keyed by content signature so
+ * the static path's cluster recomputes are no-ops.
  */
-- (void)applyLiveIconView:(UIView *)reactView
-                 markerId:(NSString *)markerId
-                   marker:(GMSAdvancedMarker *)marker
+- (void)rasterizeAdvancedMarker:(NSString *)markerId
+                          source:(UIView *)reactView
+                          marker:(GMSAdvancedMarker *)marker
+              useSignatureCache:(BOOL)useSignatureCache
 {
-  UIView *wrapper = self.advancedIconWrappers[markerId];
-  if (!wrapper) {
-    wrapper = [[UIView alloc] initWithFrame:reactView.bounds];
-    wrapper.userInteractionEnabled = NO;
-    wrapper.backgroundColor = UIColor.clearColor;
-    self.advancedIconWrappers[markerId] = wrapper;
-  }
+  CGSize size = reactView.bounds.size;
+  if (size.width <= 0 || size.height <= 0) return;
 
-  if (reactView.superview != wrapper) {
-    [reactView removeFromSuperview];
-    for (UIView *sub in [wrapper.subviews copy]) {
-      [sub removeFromSuperview];
+  NSString *signature = [NSString stringWithFormat:@"%@:%p:%.0fx%.0f",
+                         markerId, (void *)reactView, size.width, size.height];
+  if (useSignatureCache) {
+    UIImage *prev = [self.viewBitmapCache objectForKey:signature];
+    if (prev && marker.icon == prev) return;
+    if (prev) {
+      if (marker.iconView) marker.iconView = nil;
+      marker.icon = prev;
+      marker.groundAnchor = CGPointMake(0.5, 1);
+      marker.tracksViewChanges = NO;
+      return;
     }
-    [wrapper addSubview:reactView];
   }
-  wrapper.frame = (CGRect){CGPointZero, reactView.bounds.size};
-  reactView.frame = wrapper.bounds;
 
-  if (marker.iconView != wrapper) {
-    marker.icon = nil;
-    marker.iconView = wrapper;
+  UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+  fmt.opaque = NO;
+  UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
+  UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
+    // afterScreenUpdates:NO is important during the pump tick — calling
+    // YES would re-run the layout pass and tank FPS. The animation drives
+    // the UIView's render server state which drawViewHierarchyInRect
+    // captures as-is.
+    [reactView drawViewHierarchyInRect:reactView.bounds afterScreenUpdates:NO];
+  }];
+  if (useSignatureCache) {
+    [self.viewBitmapCache setObject:image forKey:signature];
   }
-  marker.tracksViewChanges = YES;
-  marker.groundAnchor = CGPointMake(0.5, 1);
-}
-
-/**
- * Static-bitmap binding. Rasterizes the UIView to a UIImage and assigns
- * to {@code marker.icon}. Cached by content signature so cluster
- * recomputes are no-ops.
- */
-- (void)applyStaticBitmap:(UIView *)reactView
-                 markerId:(NSString *)markerId
-                   marker:(GMSAdvancedMarker *)marker
-                     size:(CGSize)size
-{
-  NSString *cacheKey = [NSString stringWithFormat:@"adv:%@:%p:%.0fx%.0f",
-                        markerId, (void *)reactView, size.width, size.height];
-  UIImage *cached = [self.viewBitmapCache objectForKey:cacheKey];
-  if (!cached) {
-    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
-    fmt.opaque = NO;
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
-    cached = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
-      [reactView drawViewHierarchyInRect:reactView.bounds afterScreenUpdates:YES];
-    }];
-    [self.viewBitmapCache setObject:cached forKey:cacheKey];
-  }
-  if (marker.iconView) {
-    marker.iconView = nil;
-  }
-  if (marker.icon == cached) return;
-  marker.icon = cached;
+  if (marker.iconView) marker.iconView = nil;
+  marker.icon = image;
   marker.groundAnchor = CGPointMake(0.5, 1);
   marker.tracksViewChanges = NO;
+}
+
+/**
+ * Start or stop the per-view CADisplayLink pump based on whether any
+ * markers want live updates. The link is throttled to ~30 FPS via
+ * {@code preferredFramesPerSecond}.
+ */
+- (void)updateAdvancedPumpRunning
+{
+  BOOL shouldRun = self.advancedLiveMarkers.count > 0;
+  if (shouldRun && !self.advancedPumpLink) {
+    CADisplayLink *link = [CADisplayLink displayLinkWithTarget:self
+                                                     selector:@selector(pumpAdvancedLiveMarkers:)];
+    if (@available(iOS 15.0, *)) {
+      link.preferredFrameRateRange = CAFrameRateRangeMake(15.0f, 30.0f, 30.0f);
+    } else {
+      link.preferredFramesPerSecond = 30;
+    }
+    [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    self.advancedPumpLink = link;
+  } else if (!shouldRun && self.advancedPumpLink) {
+    [self.advancedPumpLink invalidate];
+    self.advancedPumpLink = nil;
+  }
+}
+
+- (void)pumpAdvancedLiveMarkers:(CADisplayLink *)sender
+{
+  // Snapshot the set (copy) — rasterization may remove ids on failure.
+  NSArray<NSString *> *ids = self.advancedLiveMarkers.allObjects;
+  for (NSString *markerId in ids) {
+    UIView *src = self.advancedIconViews[markerId];
+    GMSAdvancedMarker *marker = (GMSAdvancedMarker *)self.advancedMarkersById[markerId];
+    if (!src || !marker) continue;
+    [self rasterizeAdvancedMarker:markerId
+                            source:src
+                            marker:marker
+                useSignatureCache:NO];
+  }
 }
 
 /**
