@@ -15,8 +15,18 @@ using namespace facebook::react;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, GMSMarker *> *markersById;
 /** GMSAdvancedMarker entries keyed by id (separate pipeline from classic markers). */
 @property (nonatomic, strong) NSMutableDictionary<NSString *, GMSMarker *> *advancedMarkersById;
-/** Latest iconView UIView for each advanced marker id. */
+/** Latest React-rendered iconView UIView for each advanced marker id. */
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *advancedIconViews;
+/**
+ * SDK-owned UIView wrapper per advanced marker id. We never hand the
+ * React-managed UIView directly to GMS — instead it's reparented into
+ * this wrapper and the wrapper is assigned to GMSAdvancedMarker.iconView.
+ * Lets us cleanly detach on unmount before RN deallocates the underlying
+ * view (prevents the "view has been unmounted" crash).
+ */
+@property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *advancedIconWrappers;
+/** Per-marker tracksViewChanges preference (default YES if absent). */
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *advancedTracksChanges;
 /** GMUClusterManager kept for spec-compliance and cross-platform parity. */
 @property (nonatomic, strong, nullable) id clusterManager;
 @property (nonatomic, copy, nullable) NSString *currentMapId;
@@ -42,6 +52,8 @@ using namespace facebook::react;
     _markersById = [NSMutableDictionary new];
     _advancedMarkersById = [NSMutableDictionary new];
     _advancedIconViews = [NSMutableDictionary new];
+    _advancedIconWrappers = [NSMutableDictionary new];
+    _advancedTracksChanges = [NSMutableDictionary new];
     _currentMapId = @"DEMO_MAP_ID";
     _mapPolylines = [NSMutableArray new];
     _mapCircles = [NSMutableArray new];
@@ -329,8 +341,20 @@ using namespace facebook::react;
   }
   for (NSString *removedId in toRemove) {
     GMSMarker *m = self.advancedMarkersById[removedId];
-    if (m) m.map = nil;
+    if (m) {
+      m.iconView = nil;
+      m.map = nil;
+    }
+    UIView *wrapper = self.advancedIconWrappers[removedId];
+    if (wrapper) {
+      for (UIView *sub in [wrapper.subviews copy]) {
+        [sub removeFromSuperview];
+      }
+    }
     [self.advancedMarkersById removeObjectForKey:removedId];
+    [self.advancedIconWrappers removeObjectForKey:removedId];
+    [self.advancedIconViews removeObjectForKey:removedId];
+    [self.advancedTracksChanges removeObjectForKey:removedId];
   }
 
   // 2) Add / update.
@@ -339,6 +363,11 @@ using namespace facebook::react;
     CLLocationCoordinate2D coordinate = CLLocationCoordinate2DMake(
         [item[@"latitude"] doubleValue], [item[@"longitude"] doubleValue]);
     BOOL hasCustomView = [RCTConvert BOOL:item[@"hasCustomView"]];
+    // tracksViewChanges defaults to YES (live mode) when not specified.
+    BOOL tracksChanges = item[@"tracksViewChanges"] != nil
+        ? [RCTConvert BOOL:item[@"tracksViewChanges"]]
+        : YES;
+    self.advancedTracksChanges[identifier] = @(tracksChanges);
 
     GMSAdvancedMarker *marker = (GMSAdvancedMarker *)self.advancedMarkersById[identifier];
 
@@ -423,67 +452,136 @@ using namespace facebook::react;
 /**
  * Bind a React-rendered native view as the visual for an advanced marker.
  *
- * <p>This method intentionally <b>does not</b> assign {@code marker.iconView}
- * even though GMSAdvancedMarker supports it. Doing so retains a reference
- * to a React-managed UIView that may be unmounted by RN's view tree at
- * any moment (every cluster transition, every snapshot re-key, etc).
- * When RN later releases the underlying UIView, GMSMarker's retained
- * reference becomes a zombie pointer and we crash with:
+ * <p>Two paths:
+ * <ul>
+ *   <li><b>Live iconView</b> (default, {@code tracksViewChanges=YES}) —
+ *       the React UIView is moved into an SDK-owned wrapper UIView and
+ *       the wrapper is assigned to {@code GMSAdvancedMarker.iconView}.
+ *       With {@code tracksViewChanges=YES}, GMS re-renders the marker
+ *       whenever the wrapper redraws, so Animated.View, Lottie, Reanimated
+ *       and ActivityIndicator all play back in real time — the same
+ *       approach Uber/Lyft/Life360/Zomato use for live driver pins.</li>
+ *   <li><b>Static bitmap</b> ({@code tracksViewChanges=NO}) — the UIView
+ *       is rasterized to a UIImage and assigned to {@code marker.icon}.
+ *       Fastest path; use for dense maps where content doesn't animate.</li>
+ * </ul>
  *
- *   "*** Terminating app due to uncaught exception ... view has been
- *    unmounted from the React Native view hierarchy..."
- *
- * <p>Instead we rasterize the React-rendered UIView to a UIImage and
- * assign it via {@code marker.icon}. This is the same pattern the classic
- * marker pipeline uses and is the Google Maps Platform blog's official
- * recommendation for the highest-performance Advanced Marker path
- * (bitmaps composite at the GPU layer; iconViews trigger Auto Layout on
- * every camera commit).
- *
- * <p>Caching: the rendered image is keyed by (markerId, view-identity,
- * size). The common cluster-recompute case — same React snapshot view
- * with the same size — hits the cache and the {@code marker.icon} setter
- * sees the same UIImage instance, short-circuiting GMS's renderer commit.
+ * <p>A {@code markerView} of nil is the release sentinel — invoked by
+ * JS when React unmounts the snapshot view. We detach the React UIView
+ * from our wrapper and clear {@code marker.iconView} BEFORE RN
+ * deallocates the underlying view. This prevents the "view has been
+ * unmounted from the React Native view hierarchy" crash that the
+ * previous iconView implementation produced.
  */
 - (void)setAdvancedMarkerView:(UIView *)markerView markerId:(NSString *)markerId
 {
-  if (!markerView || markerId.length == 0) return;
-  // Retain the latest view so we can re-rasterize on demand if a marker
-  // is recreated. We never hand this pointer to GMS — see method docs.
-  self.advancedIconViews[markerId] = markerView;
+  if (markerId.length == 0) return;
 
-  CGSize size = markerView.bounds.size;
-  if (size.width <= 0 || size.height <= 0) {
-    // View hasn't been measured yet; React's onLayout will call us
-    // back once the snapshot view has settled.
+  // Release path — React just unmounted the snapshot view. Detach our
+  // strong reference before RN deallocates the UIView underneath us.
+  if (!markerView) {
+    UIView *wrapper = self.advancedIconWrappers[markerId];
+    if (wrapper) {
+      for (UIView *sub in [wrapper.subviews copy]) {
+        [sub removeFromSuperview];
+      }
+    }
+    GMSAdvancedMarker *marker = (GMSAdvancedMarker *)self.advancedMarkersById[markerId];
+    if (marker) {
+      marker.iconView = nil;
+      marker.icon = [self transparentPlaceholderImage];
+      marker.tracksViewChanges = NO;
+    }
+    [self.advancedIconViews removeObjectForKey:markerId];
     return;
   }
 
-  GMSMarker *marker = self.advancedMarkersById[markerId];
+  CGSize size = markerView.bounds.size;
+  if (size.width <= 0 || size.height <= 0) {
+    return;
+  }
+
+  self.advancedIconViews[markerId] = markerView;
+
+  GMSAdvancedMarker *marker = (GMSAdvancedMarker *)self.advancedMarkersById[markerId];
   if (!marker) return;
 
+  NSNumber *tracksBoxed = self.advancedTracksChanges[markerId];
+  BOOL tracksChanges = tracksBoxed ? tracksBoxed.boolValue : YES;
+
+  if (tracksChanges) {
+    [self applyLiveIconView:markerView markerId:markerId marker:marker];
+  } else {
+    [self applyStaticBitmap:markerView markerId:markerId marker:marker size:size];
+  }
+}
+
+/**
+ * Live-mode binding. Reparents the React UIView into our SDK-owned
+ * wrapper and assigns the wrapper as {@code marker.iconView} with
+ * {@code tracksViewChanges=YES}. The animation timeline runs on the
+ * React UIView (it stays in a real view hierarchy, so Animated/Lottie/
+ * Reanimated all keep ticking); GMS re-renders the marker each frame
+ * the wrapper redraws.
+ */
+- (void)applyLiveIconView:(UIView *)reactView
+                 markerId:(NSString *)markerId
+                   marker:(GMSAdvancedMarker *)marker
+{
+  UIView *wrapper = self.advancedIconWrappers[markerId];
+  if (!wrapper) {
+    wrapper = [[UIView alloc] initWithFrame:reactView.bounds];
+    wrapper.userInteractionEnabled = NO;
+    wrapper.backgroundColor = UIColor.clearColor;
+    self.advancedIconWrappers[markerId] = wrapper;
+  }
+
+  if (reactView.superview != wrapper) {
+    [reactView removeFromSuperview];
+    for (UIView *sub in [wrapper.subviews copy]) {
+      [sub removeFromSuperview];
+    }
+    [wrapper addSubview:reactView];
+  }
+  wrapper.frame = (CGRect){CGPointZero, reactView.bounds.size};
+  reactView.frame = wrapper.bounds;
+
+  if (marker.iconView != wrapper) {
+    marker.icon = nil;
+    marker.iconView = wrapper;
+  }
+  marker.tracksViewChanges = YES;
+  marker.groundAnchor = CGPointMake(0.5, 1);
+}
+
+/**
+ * Static-bitmap binding. Rasterizes the UIView to a UIImage and assigns
+ * to {@code marker.icon}. Cached by content signature so cluster
+ * recomputes are no-ops.
+ */
+- (void)applyStaticBitmap:(UIView *)reactView
+                 markerId:(NSString *)markerId
+                   marker:(GMSAdvancedMarker *)marker
+                     size:(CGSize)size
+{
   NSString *cacheKey = [NSString stringWithFormat:@"adv:%@:%p:%.0fx%.0f",
-                        markerId, (void *)markerView, size.width, size.height];
+                        markerId, (void *)reactView, size.width, size.height];
   UIImage *cached = [self.viewBitmapCache objectForKey:cacheKey];
   if (!cached) {
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
     fmt.opaque = NO;
     UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
     cached = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
-      [markerView drawViewHierarchyInRect:markerView.bounds afterScreenUpdates:YES];
+      [reactView drawViewHierarchyInRect:reactView.bounds afterScreenUpdates:YES];
     }];
     [self.viewBitmapCache setObject:cached forKey:cacheKey];
   }
-  if (marker.icon == cached) {
-    // Identity check — same UIImage already on the marker. Skipping the
-    // setter here is the single biggest factor in keeping camera moves
-    // smooth: every -setIcon: triggers a GMS renderer commit.
-    return;
+  if (marker.iconView) {
+    marker.iconView = nil;
   }
+  if (marker.icon == cached) return;
   marker.icon = cached;
   marker.groundAnchor = CGPointMake(0.5, 1);
-  // tracksViewChanges = NO so GMS doesn't try to redraw a UIView we've
-  // already rasterized into a UIImage.
   marker.tracksViewChanges = NO;
 }
 
@@ -1306,7 +1404,8 @@ static NSArray *RNCustomMapAdvancedMarkersArray(const std::vector<RNCustomMapVie
       @"opacity": @(marker.opacity),
       @"zIndex": @(marker.zIndex),
       @"hasCustomView": @(marker.hasCustomView),
-      @"isCluster": @(marker.isCluster)
+      @"isCluster": @(marker.isCluster),
+      @"tracksViewChanges": @(marker.tracksViewChanges)
     } mutableCopy];
     item[@"anchor"] = @{@"x": @(marker.anchor.x), @"y": @(marker.anchor.y)};
     [items addObject:item];

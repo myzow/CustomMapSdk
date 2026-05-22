@@ -409,6 +409,21 @@ export interface AdvancedMarkerProps {
   /** Z-axis stacking order against other markers. */
   zIndex?: number;
   /**
+   * Whether the marker should track changes to its `iconView` content
+   * frame-by-frame. When true (default), the React children are attached
+   * as a live native iconView so animations (Animated.View, Lottie,
+   * ActivityIndicator, Reanimated etc.) play back in real time — the
+   * same pattern Uber/Lyft/Life360 use for live driver pins.
+   *
+   * Set to `false` to fall back to the cached static-bitmap path. This
+   * is the highest-performance option for dense maps (500+ markers); the
+   * children are rasterized once when they first mount and the resulting
+   * texture is reused for every camera frame.
+   *
+   * Default: `true`.
+   */
+  tracksViewChanges?: boolean;
+  /**
    * Arbitrary payload carried with the marker. Surfaced on every cluster
    * member as `cluster.markers[i].data` — same convention used by `<Marker>`.
    * Stored in JS only; never bridged.
@@ -476,4 +491,11 @@ export type NativeAdvancedMarker = {
    * cluster manager itself.
    */
   isCluster?: boolean;
+  /**
+   * When true (default), the native side attaches the React children as
+   * a live iconView so animations play back in real time. When false,
+   * the children are rasterized once and reused as a static bitmap for
+   * maximum FPS at scale.
+   */
+  tracksViewChanges?: boolean;
 };

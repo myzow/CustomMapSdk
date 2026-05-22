@@ -350,20 +350,36 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
 
   /**
    * Bind a React-rendered view as the iconView of an AdvancedMarker. The
-   * view is attached as a true native subview (no rasterization), so any
-   * animated content keeps rendering. See {@link RNAdvancedMarkers#setIconView}.
+   * view is attached as a true native subview (live animation path), so
+   * Animated.View, Lottie, ActivityIndicator and Reanimated content keep
+   * playing at native frame rate.
+   *
+   * <p>A {@code markerViewTag} of -1 is the agreed-upon sentinel for
+   * "release" — invoked by JS when React unmounts the snapshot view so
+   * the native side can detach its reference BEFORE RN deallocates the
+   * underlying view. Prevents the "view has been unmounted" crash.
+   *
+   * <p>See {@link RNAdvancedMarkers#setIconView} and
+   * {@link RNAdvancedMarkers#releaseIconView}.
    */
   @Override
   public void setAdvancedMarkerView(double reactTag, String markerId, double markerViewTag) {
     UiThreadUtil.runOnUiThread(() -> {
       RNCustomMapView mapView = resolveMap((int) reactTag);
-      if (mapView == null) return;
+      if (mapView == null || markerId == null || markerId.isEmpty()) return;
+
+      int tag = (int) markerViewTag;
+      if (tag < 0) {
+        // Release sentinel — React just unmounted the snapshot view.
+        RNAdvancedMarkers.releaseIconView(mapView, markerId);
+        return;
+      }
 
       UIManager uiManager =
-          UIManagerHelper.getUIManagerForReactTag(getReactApplicationContext(), (int) markerViewTag);
+          UIManagerHelper.getUIManagerForReactTag(getReactApplicationContext(), tag);
       if (uiManager == null) return;
 
-      View markerView = uiManager.resolveView((int) markerViewTag);
+      View markerView = uiManager.resolveView(tag);
       if (markerView != null) {
         RNAdvancedMarkers.setIconView(mapView, markerId, markerView);
       }

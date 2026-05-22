@@ -207,6 +207,7 @@ function parseChildren(children: React.ReactNode) {
           anchor: props.anchor,
           zIndex: props.zIndex,
           hasCustomView: customChildren !== null,
+          tracksViewChanges: props.tracksViewChanges,
         }) as NativeAdvancedMarker,
       );
       advancedMarkerMeta.set(id, {
@@ -1145,14 +1146,26 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     // ------------------------------------------------------------------
     const setAdvancedMarkerView = useCallback(
       (markerId: string, node: View | null) => {
+        const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
         if (!node) {
           advancedMarkerViewTags.current.delete(markerId);
+          // Tell native to release its iconView reference BEFORE the
+          // underlying view is deallocated by RN — prevents the iOS
+          // "view has been unmounted" crash and lets Android detach the
+          // live iconView from the GMS overlay container cleanly. -1 is
+          // the agreed-upon sentinel for "release".
+          if (typeof fn === 'function') {
+            try {
+              fn(getReactTag(), markerId, -1);
+            } catch {
+              /* race */
+            }
+          }
           return;
         }
         const markerViewTag = findNodeHandle(node);
         if (markerViewTag == null) return;
         advancedMarkerViewTags.current.set(markerId, markerViewTag);
-        const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
         if (typeof fn !== 'function') return;
         try {
           fn(getReactTag(), markerId, markerViewTag);

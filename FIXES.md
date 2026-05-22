@@ -6,6 +6,20 @@ Google Maps `MapView` instances.
 
 ---
 
+## Issue 6 — Animations frozen on `<AdvancedMarker>` children (Lottie, Animated.View, ActivityIndicator)
+
+**Root cause.** The previous fix used bitmap rasterization for `<AdvancedMarker>` children — it eliminated the crash but produced a single static snapshot of the React subtree. Anything that animated after first layout (pulsing dots, Lottie, ActivityIndicators, Reanimated transforms, rotating vehicle icons) appeared frozen.
+
+**Fix.** Live `iconView` path — the same technique Uber / Lyft / Life360 / Zomato use under the hood.
+
+- **Android (`RNAdvancedMarkers.java`)**: each marker gets an SDK-owned `FrameLayout` wrapper. When the React snapshot view arrives via `setIconView`, it's removed from React's off-screen snapshot root and added to our wrapper (sidesteps the `IllegalStateException: child already has a parent` that the raw `iconView(reactView)` call produced). The wrapper is then handed to `AdvancedMarkerOptions.iconView(...)`. React-driven animations on the inner view continue ticking because the view is in a real native view hierarchy; GMS's overlay container recomposites the marker every time the wrapper invalidates.
+- **iOS (`RNCustomMapView.mm`)**: same wrapper pattern with a `UIView`. The wrapper is assigned to `GMSAdvancedMarker.iconView` with `tracksViewChanges = YES`, so GMS re-renders the marker on every wrapper redraw. Animated.View / Lottie / ActivityIndicator / Reanimated all play back at native frame rate.
+- **`tracksViewChanges` opt-out**: the new prop on `<AdvancedMarker>` (default `true`) lets dense scenes opt individual markers into the cached static-bitmap path for max FPS. The bitmap path is preserved with content-signature caching from Issue 3/4 so it still skips redundant `setIcon` calls.
+- **Unmount safety**: when React unmounts a snapshot view, the JS ref callback now dispatches a `-1` sentinel to `setAdvancedMarkerView`. Native detaches the React view from our wrapper and clears `marker.iconView` *before* RN deallocates the underlying view — eliminating the "view has been unmounted from the React Native view hierarchy" crash on the live path.
+
+
+---
+
 ## Issue 3 — Android crashes when `<AdvancedMarker>` has React children
 
 **Root causes.**

@@ -73,6 +73,7 @@ type NativeAdvancedMarker = Readonly<{
   zIndex?: WithDefault<Int32, 0>;
   hasCustomView?: WithDefault<boolean, false>;
   isCluster?: WithDefault<boolean, false>;
+  tracksViewChanges?: WithDefault<boolean, true>;
 }>;
 
 type NativePolyline = Readonly<{

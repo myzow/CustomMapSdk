@@ -114,6 +114,16 @@ RCT_EXPORT_METHOD(setMarkerView:(nonnull NSNumber *)reactTag markerId:(NSString 
 RCT_EXPORT_METHOD(setAdvancedMarkerView:(nonnull NSNumber *)reactTag markerId:(NSString *)markerId markerViewTag:(nonnull NSNumber *)markerViewTag)
 {
   dispatch_async(dispatch_get_main_queue(), ^{
+    // -1 is the agreed-upon release sentinel — sent by JS when React
+    // unmounts the snapshot view. Forward as nil so the native view
+    // detaches its iconView reference BEFORE RN deallocates the
+    // underlying UIView (prevents the "view has been unmounted" crash).
+    if (markerViewTag.integerValue < 0) {
+      [self withMap:reactTag block:^(RNCustomMapNativeView *view) {
+        [view setAdvancedMarkerView:nil markerId:markerId];
+      }];
+      return;
+    }
     UIView *markerView = [self.bridge.uiManager viewForReactTag:markerViewTag];
     if (!markerView) {
       return;

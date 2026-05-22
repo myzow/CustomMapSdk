@@ -253,3 +253,40 @@ using Google Maps Advanced Markers with full clustering support.
 - P1: optional "liveView" mode for genuinely animating content (Lottie) — would use a wrapper FrameLayout we own to bypass the parent-attachment crash while preserving live animation. Currently animated children are rasterized as their first laid-out frame.
 - P2: per-marker zoom-level visibility thresholds (hide markers below zoom N) to reduce GPU load on highly dense datasets.
 - P2: optional content-hash signature for iconView caching (in addition to View identity) so prop-driven re-renders of the same JSX tree hit the cache.
+
+---
+
+# Feature: Live animation in AdvancedMarker children (Jan 2026, follow-up)
+
+## Problem statement (verbatim)
+"Modify the React Native custom map SDK's AdvancedMarker component to support all animation types (Lottie, Animated.View, ActivityIndicator, Reanimated, etc.) just like production apps Life360, Uber, Lyft, and Zomato — where markers feel alive, responsive, and buttery smooth even with 500+ markers on screen. Should work in both platforms."
+
+## Approach
+Replace the bitmap-only path with a **live iconView path** (default) plus a `tracksViewChanges` opt-out for cached static bitmaps.
+
+- **Android**: SDK-owned `FrameLayout` wrapper per marker; React snapshot view is reparented into wrapper; wrapper is passed to `AdvancedMarkerOptions.iconView(...)`. Animations on the React view continue ticking because the view is in a real Android view hierarchy. GMS recomposites the marker each frame the wrapper invalidates.
+- **iOS**: same wrapper pattern with `UIView`; assigned to `GMSAdvancedMarker.iconView` with `tracksViewChanges = YES`. Animated.View / Lottie / ActivityIndicator / Reanimated all play back at native frame rate.
+- **Unmount safety**: when React's ref returns null, JS dispatches a `-1` sentinel to `setAdvancedMarkerView`. Native detaches the React view from the wrapper and clears `marker.iconView` BEFORE RN deallocates the underlying view — prevents the "view has been unmounted" crash on the live path.
+- **`tracksViewChanges` (boolean, default true)**: new prop on `<AdvancedMarker>`. When `false`, the cached static-bitmap path (with content-signature dedup) is used for max FPS in dense scenes (500+ markers).
+- **Wrapper re-use on content swap**: when a new React snapshot view arrives for the same marker id (e.g. children changed), only the wrapper's child is swapped — the marker itself stays put, so animations on the new view start immediately without marker recreation.
+
+## Files touched (this iteration)
+- `externalModules/rn-custom-map-sdk/src/types.ts` — added `tracksViewChanges` to `AdvancedMarkerProps` and `NativeAdvancedMarker`
+- `externalModules/rn-custom-map-sdk/src/MapView.tsx` — pass `tracksViewChanges` through; send `-1` sentinel from null ref
+- `externalModules/rn-custom-map-sdk/spec/RNCustomMapViewNativeComponent.ts` — added `tracksViewChanges` to Fabric component spec
+- `externalModules/rn-custom-map-sdk/android/.../RNAdvancedMarkers.java` — added `FrameLayout` wrappers, `applyLiveIconView` / `applyStaticBitmap`, `releaseIconView` cleanup, cached-view apply on create
+- `externalModules/rn-custom-map-sdk/android/.../RNCustomMapModule.java` — handle `-1` sentinel via `releaseIconView`
+- `externalModules/rn-custom-map-sdk/ios/RNCustomMapView.mm` — added `advancedIconWrappers` / `advancedTracksChanges`, `applyLiveIconView:` / `applyStaticBitmap:`, nil-marker release branch, Fabric struct → `tracksViewChanges` plumbing
+- `externalModules/rn-custom-map-sdk/ios/RNCustomMapModule.mm` — handle `-1` sentinel
+- `src/screens/ClusteringScreen.tsx` — added Lottie, ActivityIndicator, rotating vehicle samples (7 advanced markers total)
+
+## Verification
+- ✅ Code-level changes complete.
+- ⚠ Build/runtime testing on Android Studio + Xcode is on the user — no native simulator in this environment. After pulling: `cd ios && pod install` then build via Xcode; rebuild Android via Android Studio. The Clustering tab should show 7 advanced markers, of which the pulse / Lottie / loader / vehicle all animate continuously.
+
+## Backlog (refined)
+- P1: Viewport-based animation auto-pause (`autoManageVisibility` prop) — markers outside the rendered viewport switch to bitmap mode automatically; back to live when they re-enter. Major battery / GPU saver for dense maps.
+- P1: `animationQuality: 'high' | 'medium' | 'low' | 'static'` — drives an FPS cap per marker (e.g., `tracksViewChanges` cycled at lower frequency for distant markers).
+- P2: `priorityDistance` / `throttleDistance` props — distance-based throttling like Uber's "distant cars render at 15fps" pattern.
+- P2: optional content-hash signature for bitmap cache so prop-driven re-renders of the same JSX tree hit the cache instead of remeasuring.
+
