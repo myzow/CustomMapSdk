@@ -1,5 +1,6 @@
 import React, {
   forwardRef,
+  memo,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -445,6 +446,69 @@ function DefaultClusterBubble({ cluster }: { cluster: Cluster }) {
 }
 
 // ============================================================================
+// Frozen static-bitmap snapshot
+// ============================================================================
+
+/**
+ * A snapshot view for `tracksViewChanges={false}` advanced markers.
+ *
+ * <p>The contract of {@code tracksViewChanges=false} is "rasterize the
+ * marker's visual once, then never again". To honour that we wrap the
+ * children in a {@link memo} with {@code () => true} so the component
+ * NEVER re-renders after its first mount, and we capture the children
+ * via lazy {@code useState} init so subsequent prop pushes from
+ * MapView (which happen whenever a parent re-render creates new
+ * closures for {@code onPress}, etc.) are silently ignored.
+ *
+ * <p>Why this matters: even though the native side caches rasterized
+ * bitmaps by content signature, re-rendering the React subtree still
+ * walks the entire child tree, fires {@code Image.onLoad} listeners,
+ * triggers layout, and re-emits the ref callback — each of those is
+ * an opportunity for a visible micro-flicker during fast pan/zoom.
+ * Freezing the subtree eliminates the entire class of issue.
+ *
+ * <p>The native side already handles position updates separately —
+ * coordinate changes flow through the {@code advancedMarkers} prop on
+ * the {@code <NativeMapView>}, NOT through this snapshot — so a
+ * frozen visual still moves around the map correctly.
+ */
+const FrozenSnapshot = memo(
+  function FrozenSnapshot({
+    snapshotId,
+    initialChildren,
+    onMount,
+  }: {
+    snapshotId: string;
+    initialChildren: React.ReactNode;
+    onMount: (id: string, node: View | null) => void;
+  }) {
+    const [frozenChildren] = useState(() => initialChildren);
+    const nodeRef = useRef<View | null>(null);
+    return (
+      <View
+        ref={node => {
+          nodeRef.current = node;
+          onMount(snapshotId, node);
+        }}
+        collapsable={false}
+        renderToHardwareTextureAndroid
+        // Safety net: if the first ref call happened before the
+        // children had laid out (size 0×0), native silently skipped
+        // the rasterization. Re-emit once the view has a real size
+        // so the bitmap is captured for sure. This is a one-way
+        // notification — the View itself doesn't re-render.
+        onLayout={() => {
+          if (nodeRef.current) onMount(snapshotId, nodeRef.current);
+        }}
+      >
+        {frozenChildren}
+      </View>
+    );
+  },
+  () => true,
+);
+
+// ============================================================================
 // Component
 // ============================================================================
 
@@ -722,10 +786,25 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     // ==================================================================
     const clusteringEnabled =
       clusterConfig?.enabled !== false && !!clusterConfig;
-    const ignoreSet = useMemo(
-      () => new Set(clusterConfig?.ignoreClusterIds ?? []),
-      [clusterConfig?.ignoreClusterIds],
-    );
+    /**
+     * Resolved ignore-marker predicate. Accepts both shapes documented
+     * on {@link ClusterConfig.ignoreClusterIds}:
+     *
+     *  - {@code string[]} → matched against {@code marker.id}.
+     *  - {@code (markerInfo) => boolean} → called per marker with
+     *    {@code { id, data, title, coordinate }} so the caller can
+     *    match on any property (useful when the React {@code key}
+     *    drives the marker's identity but doesn't reach the
+     *    {@code identifier} prop through wrapper components).
+     */
+    const ignoreIdsRaw = clusterConfig?.ignoreClusterIds;
+    const shouldIgnoreFromCluster = useMemo(() => {
+      if (!ignoreIdsRaw)
+        return (_: { id: string }) => false;
+      if (typeof ignoreIdsRaw === 'function') return ignoreIdsRaw;
+      const set = new Set(ignoreIdsRaw);
+      return (m: { id: string }) => set.has(m.id);
+    }, [ignoreIdsRaw]);
     const clusterRadius = clusterConfig?.radius ?? DEFAULT_CLUSTER_RADIUS;
     const forceJS = clusterConfig?.forceJS ?? false;
     const renderThreshold =
@@ -768,7 +847,13 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       const cpoints: ClusterPoint[] = [];
       const pass = new Set<string>();
       for (const meta of parsed.markerMeta.values()) {
-        if (ignoreSet.has(meta.id)) {
+        const info = {
+          id: meta.id,
+          data: meta.data,
+          title: meta.title,
+          coordinate: meta.coordinate,
+        };
+        if (shouldIgnoreFromCluster(info)) {
           pass.add(meta.id);
         } else {
           cpoints.push({
@@ -780,7 +865,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         }
       }
       return { clusterablePoints: cpoints, passthroughIds: pass };
-    }, [clusteringEnabled, parsed.markerMeta, ignoreSet]);
+    }, [clusteringEnabled, parsed.markerMeta, shouldIgnoreFromCluster]);
 
     const {
       advancedClusterablePoints,
@@ -794,7 +879,13 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       const cpoints: ClusterPoint[] = [];
       const pass = new Set<string>();
       for (const meta of parsed.advancedMarkerMeta.values()) {
-        if (ignoreSet.has(meta.id)) {
+        const info = {
+          id: meta.id,
+          data: meta.data,
+          title: meta.title,
+          coordinate: meta.coordinate,
+        };
+        if (shouldIgnoreFromCluster(info)) {
           pass.add(meta.id);
         } else {
           cpoints.push({
@@ -809,7 +900,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         advancedClusterablePoints: cpoints,
         advancedPassthroughIds: pass,
       };
-    }, [clusteringEnabled, parsed.advancedMarkerMeta, ignoreSet]);
+    }, [clusteringEnabled, parsed.advancedMarkerMeta, shouldIgnoreFromCluster]);
 
     useEffect(() => {
       clusterCacheRef.current.clear();
@@ -817,7 +908,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     }, [
       clusterablePoints,
       advancedClusterablePoints,
-      ignoreSet,
+      shouldIgnoreFromCluster,
       clusterRadius,
       viewport.width,
       viewport.height,
@@ -1779,37 +1870,28 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
 
         {/*
           Static-bitmap advanced markers — `tracksViewChanges={false}`.
-          Routed through the off-screen snapshot subtree and rasterized
-          into a GMS BitmapDescriptor / UIImage via
-          setAdvancedMarkerView. The GMS marker itself renders the
-          bitmap on its own GL surface, perfectly synced with the map
-          tiles — zero compositor lag, zero flicker during pan/zoom.
-          Cluster bubbles also land here (they don't animate and benefit
-          from the synced bitmap path on cluster recompute).
+          Each marker's children are FROZEN inside FrozenSnapshot on
+          first mount: subsequent registry pushes (which fire whenever
+          the parent creates new closures for onPress etc.) are
+          silently dropped, so the React subtree never re-renders and
+          the native bitmap is rasterized exactly once. Cluster
+          bubbles also land here.
+
+          The marker still moves on the map when its coordinate
+          changes — coordinate updates flow through the
+          `advancedMarkers` prop on `<NativeMapView>`, not through
+          this subtree.
         */}
         {(Platform.OS === 'android' || Platform.OS === 'ios') &&
         staticBitmapSnapshots.length > 0 ? (
           <View pointerEvents="none" style={styles.markerSnapshotRoot}>
             {staticBitmapSnapshots.map(snapshot => (
-              <View
+              <FrozenSnapshot
                 key={`adv-static-${snapshot.id}`}
-                ref={node => setAdvancedMarkerView(snapshot.id, node)}
-                collapsable={false}
-                renderToHardwareTextureAndroid
-                onLayout={() => {
-                  const tagId = advancedMarkerViewTags.current.get(snapshot.id);
-                  const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
-                  if (tagId != null && typeof fn === 'function') {
-                    try {
-                      fn(getReactTag(), snapshot.id, tagId);
-                    } catch {
-                      /* race */
-                    }
-                  }
-                }}
-              >
-                {snapshot.children}
-              </View>
+                snapshotId={snapshot.id}
+                initialChildren={snapshot.children}
+                onMount={setAdvancedMarkerView}
+              />
             ))}
           </View>
         ) : null}

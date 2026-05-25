@@ -137,8 +137,24 @@ export type ClusterConfig = {
   /**
    * Marker ids that should never be folded into a cluster. They pass through
    * as ordinary markers regardless of zoom.
+   *
+   * Can be either:
+   * - A list of marker ids (matched against {@code identifier} prop).
+   * - A predicate {@code (markerInfo) => boolean} that receives
+   *   {@code { id, data, title, coordinate }} per marker — useful when
+   *   the marker is rendered through a wrapper component that doesn't
+   *   forward the React {@code key} as an {@code identifier} (e.g.,
+   *   the "user-location" marker pattern where the host knows the
+   *   marker by a property on {@code data}, not by id).
    */
-  ignoreClusterIds?: ReadonlyArray<string>;
+  ignoreClusterIds?:
+    | ReadonlyArray<string>
+    | ((marker: {
+        id: string;
+        data?: any;
+        title?: string;
+        coordinate: Coordinate;
+      }) => boolean);
   /** Cluster radius in screen pixels. Default 60. */
   radius?: number;
   /**

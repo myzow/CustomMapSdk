@@ -6,6 +6,59 @@ Google Maps `MapView` instances.
 
 ---
 
+## Issue 13 — `tracksViewChanges={false}` markers still re-rendering on every parent render
+
+**Symptom.** Even with `tracksViewChanges={false}`, the marker's React subtree re-rendered every time the parent re-rendered (e.g., during pan/zoom, when handler closures like `onPress={() => onPressMarker(user)}` are recreated). Each re-render fired the `ref` callback → emitted `setAdvancedMarkerView` → triggered a layout / image-source-reload cycle that produced a visible micro-flicker.
+
+**Fix.** Wrapped the static-bitmap snapshot in a new `<FrozenSnapshot>` component that uses `React.memo(Component, () => true)` plus `useState(() => initialChildren)` to capture children on first mount and **never re-render** after. The component is functionally inert for the rest of its lifetime — its native bitmap is rasterized exactly once and the React subtree never touches it again. Coordinate updates still flow through the `advancedMarkers` prop on the `<NativeMapView>` (separate code path), so the marker still moves around the map correctly while the visual stays frozen.
+
+### Trade-off
+With `tracksViewChanges={false}` the marker is frozen at first mount. If the visual data later changes (e.g., the user's `profileIcon` URL changes), the bitmap will NOT update. To swap to a different visual, briefly flip `tracksViewChanges` to `true` (forcing a re-mount in the live path), then flip back. This matches react-native-maps' semantics for the same prop.
+
+### Files touched
+- `externalModules/rn-custom-map-sdk/src/MapView.tsx` — adds `FrozenSnapshot`, replaces inline static-bitmap render with it.
+
+---
+
+## Issue 14 — `ignoreClusterIds: ['user-location']` no longer matches
+
+**Symptom.**
+```jsx
+<MapView clusterConfig={{ ignoreClusterIds: ['user-location'] }}>
+  <SingleMarker key="user-location" userData={undefined} ... />
+</MapView>
+```
+The user-location marker still got swept into clusters — `ignoreClusterIds` was silently a no-op.
+
+**Root cause.** The React `key="user-location"` is not visible to child components. Inside `SingleMarker` the AdvancedMarker is configured as `identifier={userData?.userId || ''}` — and since `userData` is `undefined`, identifier becomes the empty string. The SDK auto-generates a stable id (e.g., `auto-adv-3`) for empty identifiers, so `'user-location'` in `ignoreClusterIds` never matches.
+
+**Fix (two paths, pick whichever fits your codebase better).**
+
+1. **Pass an explicit `identifier`** through your wrapper. Cleanest for known-identity markers:
+   ```jsx
+   // SingleMarker.tsx — accept an override
+   type SingleMarkerProps = { identifier?: string; userData?: MapMember; ... };
+   <AdvancedMarker identifier={identifier ?? userData?.userId ?? ''} ... />
+
+   // Usage
+   <SingleMarker identifier="user-location" userData={undefined} ... />
+   ```
+2. **Use the new function-predicate form of `ignoreClusterIds`** — match by any property, not just id:
+   ```jsx
+   clusterConfig={{
+     enabled: true,
+     ignoreClusterIds: (marker) =>
+       marker.data === undefined || marker.data?.kind === 'user-location',
+   }}
+   ```
+   The predicate receives `{ id, data, title, coordinate }` per marker. Backwards-compatible with the existing `string[]` form.
+
+### Files touched
+- `externalModules/rn-custom-map-sdk/src/types.ts` — `ignoreClusterIds` widened to `ReadonlyArray<string> | ((marker) => boolean)`.
+- `externalModules/rn-custom-map-sdk/src/MapView.tsx` — `shouldIgnoreFromCluster` predicate replaces the old `ignoreSet`.
+
+---
+
 ## Issue 12 — `<AdvancedMarker>` wrapped in a custom component renders nothing
 
 **Symptom.**
