@@ -19,6 +19,7 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import TabbedMapScreen from './src/screens/TabbedMapScreen';
 import ClusteringScreen from './src/screens/ClusteringScreen';
 import AllMarkersScreen from './src/screens/AllMarkersScreen';
+import OverlaySyncScreen from './src/screens/OverlaySyncScreen';
 
 const Tab = createBottomTabNavigator();
 
@@ -98,6 +99,15 @@ export default function App() {
           options={{
             title: 'All Markers',
             tabBarIcon: ({ color }) => tabIcon('AL', color),
+          }}
+        />
+
+        <Tab.Screen
+          name="OverlaySync"
+          component={OverlaySyncScreen}
+          options={{
+            title: 'Overlay Sync',
+            tabBarIcon: ({ color }) => tabIcon('OV', color),
           }}
         />
       </Tab.Navigator>

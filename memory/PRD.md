@@ -293,6 +293,76 @@ Replace the bitmap-only path with a **live iconView path** (default) plus a `tra
 
 ---
 
+# Verification: bridge-signature audit + Overlay Sync test screen (Feb 2026)
+
+## Why
+After implementing the Uber/Life360 native-synced overlay architecture
+(Issue 10), the user wanted a sanity check that the new
+`setMarkerOverlay` TurboModule method is correctly registered across
+every layer so a runtime JS bridge crash doesn't surprise them on
+device — plus a dedicated tab to exercise the new pipeline.
+
+## Bridge-signature audit (codegen contract verification)
+
+| Layer | Symbol | Verified |
+|---|---|---|
+| TS spec `NativeRNCustomMapViewManager.ts` | `setMarkerOverlay(reactTag: Int32, markerId: string, markerViewTag: Int32, latitude: Double, longitude: Double, anchorX: Double, anchorY: Double): void` | ✓ |
+| Android codegen → `NativeRNCustomMapViewManagerSpec` (abstract) | `setMarkerOverlay(double, String, double, double, double, double, double)` | ✓ matches RN's `Int32→double`, `Double→double`, `string→String` codegen mapping |
+| `RNCustomMapModule.java` | `@Override public void setMarkerOverlay(double reactTag, String markerId, double markerViewTag, double latitude, double longitude, double anchorX, double anchorY)` | ✓ `@Override` confirmed compile-time against codegen-generated abstract method |
+| iOS `RCT_EXPORT_METHOD` in `RNCustomMapModule.mm` | `setMarkerOverlay:markerId:markerViewTag:latitude:longitude:anchorX:anchorY:` | ✓ 7-arg selector matches JS call signature |
+| JS caller in `MapView.tsx` (`setOverlayView` + overlay effect) | `fn(getReactTag(), markerId, tag, lat, lng, 0.5, 1)` | ✓ 7 positional args |
+
+Plus same audit on the prior in-flight methods: `setAdvancedMarkerView`,
+`setMarkerView`, `setActive`, `forceRedraw`, `computeClusters`,
+`prefetchMarkerIcons`, `clearMarkerIconCache` — all match.
+
+## New tab: Overlay Sync (test bed)
+
+Added `src/screens/OverlaySyncScreen.tsx` and a 6th tab (`'OV'`
+glyph, title "Overlay Sync") in `App.tsx`.
+
+What it exercises:
+1. **Live driver tracking** — 5 markers whose lat/lng mutate every
+   500ms via `setInterval`. Triggers JS→native `setMarkerOverlay` calls
+   on every tick. Native re-projects the new coord on the next camera
+   frame.
+2. **Continuous animations** — every marker plays a different live
+   animation (Animated.View pulse, ActivityIndicator, inline Lottie,
+   rotating arrow, label pin). All animations must keep ticking
+   smoothly during pan/zoom (the entire point of the overlay layer
+   vs the previous bitmap-pump approach).
+3. **Touch propagation** — each overlay marker has its own `onPress`
+   that pops an alert; empty space between markers passes through to
+   the map (`pointerEvents="box-none"` on the overlay layer).
+4. **Clustering compatibility** — a 12-marker dense cluster at the
+   bottom forces the cluster-bubble path through the same overlay
+   pipeline.
+5. **Pause/Resume control** — bottom toggle lets the tester freeze
+   driver movement to isolate map pan/zoom sync from data-driven
+   updates.
+6. **Recenter control** — programmatic `animateToRegion()` to verify
+   the overlays follow a scripted camera animation pixel-perfectly.
+
+## Files touched
+- `App.tsx` — adds the `OverlaySync` tab as the 6th `Tab.Screen`
+- `src/screens/OverlaySyncScreen.tsx` — new test screen (~440 lines)
+
+## How to verify (user)
+1. `yarn && (cd ios && pod install)` then build via Xcode + Android Studio.
+2. Tab to "OV". Five animated drivers visible top-half; one dense cluster
+   bottom-half.
+3. Pan/zoom — every marker stays pinned to its lat/lng; no flicker;
+   animations keep playing during the gesture.
+4. Tap a driver — alert shows label + coordinate.
+5. Tap "Pause Live Movement" — drivers freeze; pan/zoom should still
+   keep them perfectly pinned.
+6. Tap "Recenter" — map animates back to SF, overlays follow frame-
+   for-frame.
+
+
+
+---
+
 # Hotfix: replace iconView reparenting with bitmap pumping (Jan 2026)
 
 ## Bug reported
