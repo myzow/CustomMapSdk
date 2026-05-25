@@ -37,6 +37,16 @@ using namespace facebook::react;
 /** Per-marker requested opacity captured so reveal restores user intent. */
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *advancedRequestedOpacity;
 /**
+ * Native-synced overlay entries (Uber/Life360 pattern). Each entry binds
+ * a React-rendered UIView to a lat/lng and an anchor; on every
+ * mapView:didChangeCameraPosition: tick we project the coord to screen
+ * pixels and assign view.center, so the overlay tracks the map
+ * pixel-perfectly during drag/zoom. The view stays in React's tree —
+ * we never reparent. Keys: markerId. Values: NSDictionary with view,
+ * coordinate (NSValue of CLLocationCoordinate2D), anchorX, anchorY.
+ */
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary *> *overlayEntries;
+/**
  * Single CADisplayLink that drives the live-marker rasterization pump.
  * Allocated lazily when the first live marker arrives, invalidated when
  * the last live marker is removed. Throttled to ~30 FPS.
@@ -78,6 +88,7 @@ using namespace facebook::react;
     _advancedTracksChanges = [NSMutableDictionary new];
     _advancedPendingReveal = [NSMutableSet new];
     _advancedRequestedOpacity = [NSMutableDictionary new];
+    _overlayEntries = [NSMutableDictionary new];
     _currentMapId = @"DEMO_MAP_ID";
     _mapPolylines = [NSMutableArray new];
     _mapCircles = [NSMutableArray new];
@@ -1079,6 +1090,11 @@ using namespace facebook::react;
 
 - (void)mapView:(GMSMapView *)mapView didChangeCameraPosition:(GMSCameraPosition *)position
 {
+  // Reposition every native-synced overlay marker IN THIS FRAME so it
+  // tracks the map pixel-perfectly during drag/zoom (Uber/Life360
+  // pattern). Empty-state fast path inside -applyOverlayPositions
+  // makes this near-no-op when no overlays are registered.
+  [self applyOverlayPositions];
   if (self.onRegionChange) {
     self.onRegionChange(@{@"region": [self regionPayload], @"details": @{@"isGesture": @(self.lastRegionChangeWasGesture)}});
   }
@@ -1087,9 +1103,78 @@ using namespace facebook::react;
 - (void)mapView:(GMSMapView *)mapView idleAtCameraPosition:(GMSCameraPosition *)position
 {
   self.advancedCameraMoving = NO;
+  // One last apply on idle so the final-settled coordinates land
+  // exactly where the map composited them (didChangeCameraPosition
+  // doesn't always fire for the very last animation frame).
+  [self applyOverlayPositions];
   if (self.onRegionChangeComplete) {
     self.onRegionChangeComplete(@{@"region": [self regionPayload], @"details": @{@"isGesture": @(self.lastRegionChangeWasGesture)}});
   }
+}
+
+/**
+ * Register or update a native-synced overlay entry. Idempotent.
+ * Coordinate updates (e.g., live driver tracking) take effect on the
+ * next applyOverlayPositions call — either the very next camera tick
+ * or the immediate apply below.
+ */
+- (void)setMarkerOverlayView:(UIView *)overlayView
+                      markerId:(NSString *)markerId
+                    coordinate:(CLLocationCoordinate2D)coord
+                       anchorX:(CGFloat)anchorX
+                       anchorY:(CGFloat)anchorY
+{
+  if (markerId.length == 0) return;
+  if (!overlayView) {
+    NSMutableDictionary *removed = self.overlayEntries[markerId];
+    if (removed) {
+      UIView *v = removed[@"view"];
+      // Park off-screen to prevent a stale frame from flashing in the
+      // wrong place between unmount and React's actual deallocation.
+      if (v) v.center = CGPointMake(-100000, -100000);
+    }
+    [self.overlayEntries removeObjectForKey:markerId];
+    return;
+  }
+  NSValue *coordValue = [NSValue valueWithBytes:&coord objCType:@encode(CLLocationCoordinate2D)];
+  NSMutableDictionary *entry = self.overlayEntries[markerId];
+  if (!entry) {
+    entry = [NSMutableDictionary new];
+    self.overlayEntries[markerId] = entry;
+  }
+  entry[@"view"] = overlayView;
+  entry[@"coord"] = coordValue;
+  entry[@"anchorX"] = @(anchorX);
+  entry[@"anchorY"] = @(anchorY);
+  [self applyOverlayEntry:entry];
+}
+
+- (void)applyOverlayPositions
+{
+  if (self.overlayEntries.count == 0) return;
+  for (NSString *markerId in self.overlayEntries.allKeys) {
+    [self applyOverlayEntry:self.overlayEntries[markerId]];
+  }
+}
+
+- (void)applyOverlayEntry:(NSDictionary *)entry
+{
+  UIView *view = entry[@"view"];
+  NSValue *coordValue = entry[@"coord"];
+  if (!view || !coordValue || !self.mapView) return;
+  CLLocationCoordinate2D coord;
+  [coordValue getValue:&coord];
+  CGPoint screen = [self.mapView.projection pointForCoordinate:coord];
+  CGFloat anchorX = [entry[@"anchorX"] doubleValue];
+  CGFloat anchorY = [entry[@"anchorY"] doubleValue];
+  CGSize size = view.bounds.size;
+  // Convert the (anchorX, anchorY) normalized anchor to a UIView .center
+  // offset. .center is the *center* of the view in superview coords, so
+  // we shift by (0.5 - anchorX) * width and (0.5 - anchorY) * height
+  // from the projected point.
+  CGFloat dx = (0.5 - anchorX) * size.width;
+  CGFloat dy = (0.5 - anchorY) * size.height;
+  view.center = CGPointMake(screen.x + dx, screen.y + dy);
 }
 
 - (void)mapView:(GMSMapView *)mapView didTapOverlay:(GMSOverlay *)overlay

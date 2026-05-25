@@ -81,6 +81,29 @@ export interface Spec extends TurboModule {
    */
   setAdvancedMarkerView(reactTag: Int32, markerId: string, markerViewTag: Int32): void;
 
+  /**
+   * Register a React-rendered native view as a synced overlay for an
+   * advanced marker. The view stays in React's tree (no reparenting,
+   * no Fabric crash); native projects the marker's lat/lng to screen
+   * pixels on every camera frame and applies translation to the view
+   * directly — same frame as the map renders, so the overlay tracks the
+   * map pixel-perfectly during drag/zoom (the technique Uber / Life360 /
+   * Lyft use for live driver pins, courier dots, family avatars).
+   *
+   * Passing {@code markerViewTag = -1} releases the overlay. Coordinates
+   * are passed every call so prop-driven moves (e.g. live driver
+   * tracking) take effect immediately.
+   */
+  setMarkerOverlay(
+    reactTag: Int32,
+    markerId: string,
+    markerViewTag: Int32,
+    latitude: Double,
+    longitude: Double,
+    anchorX: Double,
+    anchorY: Double,
+  ): void;
+
   // ---- Lifecycle (Issue 2 fix) ----
   // setActive(true) brings the embedded native MapView back to RESUMED state
   // and forces a redraw — call this on tab focus.

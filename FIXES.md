@@ -6,6 +6,36 @@ Google Maps `MapView` instances.
 
 ---
 
+## Issue 10 — Uber/Life360 quality: native-synced overlay markers
+
+**Previous approaches and their limits.**
+
+| Approach | Problem |
+|---|---|
+| Live `iconView(view)` with React reparenting | Fabric mount layer crash (Issue 6 root #2) |
+| Bitmap pump at 60 FPS with `setIcon(...)` per frame | Even with `CATransaction flush` + `cameraMoving` gate, leaves a brief moment between marker create / destroy on cluster recompute where the user can perceive a flicker. Also costs N × 60 GPU texture uploads per second. |
+| Disable animation entirely | Defeats the purpose. |
+
+**Final approach — native-synced overlay views (the architecture Uber / Lyft / Life360 / Zomato actually use).** The React-rendered marker view is mounted as a **normal sibling of the native map** (a child of an absolute-positioned overlay layer over the MapView). It never gets reparented — React owns it from mount to unmount, so Fabric is happy. On every camera frame native projects the marker's lat/lng to screen pixels and writes `view.setTranslationX/Y(...)` (Android) / `view.center = ...` (iOS) directly. The translation write lands inside the same UI-thread frame as the map's camera composition, so the overlay tracks the map pixel-perfectly during drag/zoom.
+
+What this delivers:
+- **Zero flicker** on drag/zoom end — the marker view is a React-managed native view that already exists; cluster recompute just re-registers its coordinate, native repositions on the next frame. No bitmap creation, no setIcon, no default-pin flash.
+- **Genuine 60 FPS animations** — Animated.View / Lottie / ActivityIndicator / Reanimated run in their actual native view (no per-frame rasterization), at the device's native refresh rate, with full useNativeDriver path intact.
+- **Pixel-perfect sync** — the per-frame translation write happens in the camera-move callback (Android `OnCameraMoveListener.onCameraMove()`, iOS `mapView:didChangeCameraPosition:`), both of which fire on the main thread synchronously with the map's own rendering, before the surface is composited.
+- **Cluster recompute on drag/zoom-idle is silent** — overlay views remount with the new cluster bubble's coordinate; the previous singleton overlays unmount cleanly. The GMS markers underneath (still created for API compatibility) stay at alpha=0 and contribute zero visuals.
+
+### Files added / changed
+- **NEW** `externalModules/rn-custom-map-sdk/android/.../RNMarkerOverlay.java` — overlay state + `set` / `remove` / `onCameraMove` projecting `Projection.toScreenLocation(...)` to view translation
+- `externalModules/rn-custom-map-sdk/android/.../RNCustomMapView.java` — added `overlayState` field, `RNMarkerOverlay.onCameraMove(this)` call from `OnCameraMoveListener` and `OnCameraIdleListener`
+- `externalModules/rn-custom-map-sdk/android/.../RNCustomMapModule.java` — new `setMarkerOverlay(reactTag, markerId, viewTag, lat, lng, ax, ay)` TurboModule method
+- `externalModules/rn-custom-map-sdk/ios/RNCustomMapView.h` + `.mm` — added `overlayEntries` dict, `-setMarkerOverlayView:markerId:coordinate:anchorX:anchorY:` + `applyOverlayPositions` + `applyOverlayEntry:`, hooks in `mapView:didChangeCameraPosition:` and `mapView:idleAtCameraPosition:`
+- `externalModules/rn-custom-map-sdk/ios/RNCustomMapModule.mm` — new `setMarkerOverlay` `RCT_EXPORT_METHOD`
+- `externalModules/rn-custom-map-sdk/spec/NativeRNCustomMapViewManager.ts` — `setMarkerOverlay` added to the TurboModule spec
+- `externalModules/rn-custom-map-sdk/src/MapView.tsx` — added overlay layer JSX (replaces the old off-screen snapshot root), per-marker `setOverlayView` ref handler, coordinate-sync effect, `onPress` Pressable wrapper preserving the existing AdvancedMarker `onPress` API.
+
+
+---
+
 ## Issue 6 — Animations frozen on `<AdvancedMarker>` children (Lottie, Animated.View, ActivityIndicator)
 
 **Root cause #1 (frozen content).** The Issue 3/4 fix rasterized children to a static bitmap. Anything that animated after first layout — pulsing dots, Lottie, ActivityIndicators, Reanimated transforms, rotating vehicle icons — appeared frozen.

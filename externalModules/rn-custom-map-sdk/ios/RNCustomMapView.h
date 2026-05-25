@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <CoreLocation/CoreLocation.h>
 #import <React/RCTComponent.h>
 #import <React/RCTViewComponentView.h>
 
@@ -34,6 +35,18 @@
 - (void)setAdvancedMarkers:(NSArray *)advancedMarkers;
 - (void)setMapId:(NSString *)mapId;
 - (void)setAdvancedMarkerView:(UIView *)markerView markerId:(NSString *)markerId;
+/**
+ * Bind a React-rendered overlay UIView to a marker id. The view stays
+ * in React's tree (no reparenting); native projects the coordinate to
+ * screen pixels on every camera frame and assigns view.center, so the
+ * overlay tracks the map pixel-perfectly during drag/zoom. Pass
+ * {@code overlayView=nil} to release. (Uber/Life360 model.)
+ */
+- (void)setMarkerOverlayView:(nullable UIView *)overlayView
+                    markerId:(nonnull NSString *)markerId
+                  coordinate:(CLLocationCoordinate2D)coord
+                     anchorX:(CGFloat)anchorX
+                     anchorY:(CGFloat)anchorY;
 - (void)setPolylines:(NSArray *)polylines;
 - (void)setCircles:(NSArray *)circles;
 - (void)prefetchMarkerIcons:(NSArray<NSString *> *)urls;

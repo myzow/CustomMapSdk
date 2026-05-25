@@ -11,6 +11,7 @@ import {
   findNodeHandle,
   Image,
   Platform,
+  Pressable,
   StyleSheet,
   Text,
   View,
@@ -1310,6 +1311,76 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       [clusteringEnabled, onRegionChangeComplete, dispatchToGate],
     );
 
+    /**
+     * Pixel-perfect synced overlay registration (Uber/Life360 pattern).
+     * The overlay view is mounted as a normal RN child of the
+     * `markerOverlayLayer` (no reparenting, no Fabric crash). On mount
+     * we tell native its viewTag and lat/lng; native then projects the
+     * coord to screen pixels on every camera frame and sets the view's
+     * translation directly. The marker stays in perfect sync with the
+     * map because the translate-write lands inside the same UI-thread
+     * frame as the map's camera composition.
+     */
+    const overlayViewTags = useRef(new Map<string, number>());
+    const setOverlayView = useCallback(
+      (
+        markerId: string,
+        node: View | null,
+        latitude: number,
+        longitude: number,
+      ) => {
+        const fn = (NativeMapViewManager as any).setMarkerOverlay;
+        if (typeof fn !== 'function') return;
+        if (!node) {
+          overlayViewTags.current.delete(markerId);
+          try {
+            fn(getReactTag(), markerId, -1, 0, 0, 0.5, 1);
+          } catch {
+            /* race */
+          }
+          return;
+        }
+        const tag = findNodeHandle(node);
+        if (tag == null) return;
+        overlayViewTags.current.set(markerId, tag);
+        try {
+          fn(getReactTag(), markerId, tag, latitude, longitude, 0.5, 1);
+        } catch {
+          /* race */
+        }
+      },
+      [getReactTag],
+    );
+
+    /**
+     * Re-emit overlay coordinates whenever the advanced-marker set
+     * changes (cluster recompute, live driver lat/lng update). Native
+     * re-projects on the next camera frame so the marker stays in sync.
+     */
+    useEffect(() => {
+      const fn = (NativeMapViewManager as any).setMarkerOverlay;
+      if (typeof fn !== 'function') return;
+      advancedSnapshots.forEach(({ id }) => {
+        const tag = overlayViewTags.current.get(id);
+        if (tag == null) return;
+        const meta = parsed.advancedMarkerMeta.get(id);
+        if (!meta) return;
+        try {
+          fn(
+            getReactTag(),
+            id,
+            tag,
+            meta.coordinate.latitude,
+            meta.coordinate.longitude,
+            0.5,
+            1,
+          );
+        } catch {
+          /* race */
+        }
+      });
+    }, [getReactTag, advancedSnapshots, parsed.advancedMarkerMeta]);
+
     return (
       <View style={styles.container} onLayout={onContainerLayout}>
         <NativeMapView
@@ -1412,30 +1483,85 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
           </View>
         ) : null}
 
-        {/* Advanced snapshot root — attached as native iconView (no raster) */}
+        {/*
+          Native-synced overlay layer (Uber/Life360 pattern). Each
+          advanced marker's custom React subtree is rendered here as a
+          real RN view — animations play at native frame rate because the
+          view is in a live view hierarchy, not a periodic bitmap
+          snapshot. Native re-projects the marker's lat/lng to screen
+          pixels on every camera frame and writes
+          view.setTranslationX/Y / view.center directly, so the overlay
+          tracks the map pixel-perfectly during drag/zoom with zero
+          flicker, zero setIcon calls, zero red-pin flash.
+
+          pointerEvents="box-none" — the layer itself doesn't intercept
+          touches, but child marker views do (use TouchableOpacity etc.
+          inside your marker to handle press).
+        */}
         {(Platform.OS === 'android' || Platform.OS === 'ios') &&
         advancedSnapshots.length > 0 ? (
-          <View pointerEvents="none" style={styles.markerSnapshotRoot}>
-            {advancedSnapshots.map(snapshot => (
-              <View
-                key={`adv-${snapshot.id}`}
-                ref={node => setAdvancedMarkerView(snapshot.id, node)}
-                collapsable={false}
-                onLayout={() => {
-                  const tagId = advancedMarkerViewTags.current.get(snapshot.id);
-                  const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
-                  if (tagId != null && typeof fn === 'function') {
-                    try {
-                      fn(getReactTag(), snapshot.id, tagId);
-                    } catch {
-                      /* race */
-                    }
+          <View
+            pointerEvents="box-none"
+            style={StyleSheet.absoluteFill}
+            collapsable={false}
+          >
+            {advancedSnapshots.map(snapshot => {
+              const meta = parsed.advancedMarkerMeta.get(snapshot.id);
+              if (!meta) return null;
+              const onPress = parsed.markerPressHandlers.get(snapshot.id);
+              const content = onPress ? (
+                <Pressable
+                  onPress={() => {
+                    onPress({
+                      id: snapshot.id,
+                      coordinate: meta.coordinate,
+                      data: meta.data,
+                      title: meta.title,
+                    });
+                  }}
+                >
+                  {snapshot.children}
+                </Pressable>
+              ) : (
+                snapshot.children
+              );
+              return (
+                <View
+                  key={`adv-${snapshot.id}`}
+                  ref={node =>
+                    setOverlayView(
+                      snapshot.id,
+                      node,
+                      meta.coordinate.latitude,
+                      meta.coordinate.longitude,
+                    )
                   }
-                }}
-              >
-                {snapshot.children}
-              </View>
-            ))}
+                  collapsable={false}
+                  style={styles.overlayMarker}
+                  onLayout={() => {
+                    const tag = overlayViewTags.current.get(snapshot.id);
+                    const fn = (NativeMapViewManager as any).setMarkerOverlay;
+                    if (tag != null && typeof fn === 'function') {
+                      try {
+                        fn(
+                          getReactTag(),
+                          snapshot.id,
+                          tag,
+                          meta.coordinate.latitude,
+                          meta.coordinate.longitude,
+                          0.5,
+                          1,
+                        );
+                      } catch {
+                        /* race */
+                      }
+                    }
+                  }}
+                >
+                  {content}
+                </View>
+              );
+            })}
           </View>
         ) : null}
       </View>
@@ -1452,6 +1578,19 @@ const styles = StyleSheet.create({
     left: -10000,
     top: -10000,
     alignItems: 'flex-start',
+  },
+  /**
+   * Each overlay marker sits at the layer's origin with zero size; its
+   * actual on-screen position comes from native-side
+   * setTranslationX/Y (Android) / .center (iOS) writes applied on every
+   * camera frame. Crucially we do NOT set any `transform` here — native
+   * needs exclusive write access to that property to keep the marker
+   * synced with the map.
+   */
+  overlayMarker: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
   },
 });
 

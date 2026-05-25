@@ -105,6 +105,8 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
   final Map<String, com.google.android.gms.maps.model.BitmapDescriptor> markerViewBitmaps = new HashMap<>();
   /** Advanced-marker pipeline state. See {@link RNAdvancedMarkers}. */
   final RNAdvancedMarkers.State advancedState = new RNAdvancedMarkers.State();
+  /** Overlay-marker state — drives the Uber/Life360-style native-synced overlay positioning. */
+  final RNMarkerOverlay.State overlayState = new RNMarkerOverlay.State();
   /** Whether clustering should be applied to advanced markers. */
   boolean advancedClusteringEnabled = true;
   /** Pending advanced markers payload, applied after onMapReady. */
@@ -425,9 +427,17 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
       // settles we resume from the current animation state.
       advancedState.cameraMoving = true;
     });
-    map.setOnCameraMoveListener(() -> emitRegion("onRegionChange"));
+    map.setOnCameraMoveListener(() -> {
+      // Reposition every native-synced overlay marker IN THIS FRAME so
+      // it tracks the map pixel-perfectly during drag/zoom. Empty-state
+      // fast path inside RNMarkerOverlay makes this a near-no-op when
+      // no overlays are registered.
+      RNMarkerOverlay.onCameraMove(this);
+      emitRegion("onRegionChange");
+    });
     map.setOnCameraIdleListener(() -> {
       advancedState.cameraMoving = false;
+      RNMarkerOverlay.onCameraMove(this);
       // Forward to AdvancedMarkers cluster manager when present so clusters
       // recompute on idle. Safe to call when no advanced markers are mounted.
       if (advancedState.clusterManager != null) {

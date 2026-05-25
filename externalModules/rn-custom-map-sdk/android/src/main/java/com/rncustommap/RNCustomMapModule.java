@@ -386,6 +386,42 @@ public class RNCustomMapModule extends NativeRNCustomMapViewManagerSpec {
     });
   }
 
+  /**
+   * Bind a React-rendered view as a native-synced overlay for an advanced
+   * marker. Coordinates are projected to screen pixels on every camera
+   * frame (Uber/Life360 pattern) — see {@link RNMarkerOverlay}.
+   */
+  @Override
+  public void setMarkerOverlay(
+      double reactTag,
+      String markerId,
+      double markerViewTag,
+      double latitude,
+      double longitude,
+      double anchorX,
+      double anchorY) {
+    UiThreadUtil.runOnUiThread(() -> {
+      RNCustomMapView mapView = resolveMap((int) reactTag);
+      if (mapView == null || markerId == null || markerId.isEmpty()) return;
+
+      int tag = (int) markerViewTag;
+      if (tag < 0) {
+        RNMarkerOverlay.remove(mapView, markerId);
+        return;
+      }
+
+      UIManager uiManager =
+          UIManagerHelper.getUIManagerForReactTag(getReactApplicationContext(), tag);
+      if (uiManager == null) return;
+
+      View overlay = uiManager.resolveView(tag);
+      if (overlay != null) {
+        RNMarkerOverlay.set(mapView, markerId, overlay,
+            latitude, longitude, (float) anchorX, (float) anchorY);
+      }
+    });
+  }
+
   // -------------------- Native icon cache --------------------
 
   /**

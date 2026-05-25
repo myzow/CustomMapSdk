@@ -134,6 +134,39 @@ RCT_EXPORT_METHOD(setAdvancedMarkerView:(nonnull NSNumber *)reactTag markerId:(N
   });
 }
 
+RCT_EXPORT_METHOD(setMarkerOverlay:(nonnull NSNumber *)reactTag
+                  markerId:(NSString *)markerId
+                  markerViewTag:(nonnull NSNumber *)markerViewTag
+                  latitude:(double)latitude
+                  longitude:(double)longitude
+                  anchorX:(double)anchorX
+                  anchorY:(double)anchorY)
+{
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (markerViewTag.integerValue < 0) {
+      [self withMap:reactTag block:^(RNCustomMapNativeView *view) {
+        [view setMarkerOverlayView:nil
+                          markerId:markerId
+                        coordinate:CLLocationCoordinate2DMake(0, 0)
+                           anchorX:0.5
+                           anchorY:1.0];
+      }];
+      return;
+    }
+    UIView *overlayView = [self.bridge.uiManager viewForReactTag:markerViewTag];
+    if (!overlayView) return;
+    CLLocationCoordinate2D coord = CLLocationCoordinate2DMake(latitude, longitude);
+    [self withMap:reactTag block:^(RNCustomMapNativeView *view) {
+      [view setMarkerOverlayView:overlayView
+                        markerId:markerId
+                      coordinate:coord
+                         anchorX:(CGFloat)anchorX
+                         anchorY:(CGFloat)anchorY];
+    }];
+  });
+}
+
+
 // Lifecycle commands are Android-only — no-op on iOS (MapKit/GMS-iOS does
 // not exhibit the bottom-tab white-screen bug), but exposed for cross-platform
 // JS calls to remain symmetric.
