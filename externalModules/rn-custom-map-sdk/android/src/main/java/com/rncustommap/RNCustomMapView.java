@@ -413,10 +413,21 @@ public class RNCustomMapView extends FrameLayout implements OnMapReadyCallback {
       @Override public void onMarkerDrag(@NonNull Marker marker) { emitMarker("onMarkerDrag", marker); }
       @Override public void onMarkerDragEnd(@NonNull Marker marker) { emitMarker("onMarkerDragEnd", marker); }
     });
-    map.setOnCameraMoveStartedListener(reason ->
-        lastRegionChangeWasGesture = reason == GoogleMap.OnCameraMoveStartedListener.REASON_GESTURE);
+    map.setOnCameraMoveStartedListener(reason -> {
+      lastRegionChangeWasGesture = reason == GoogleMap.OnCameraMoveStartedListener.REASON_GESTURE;
+      // Pause the AdvancedMarker live-pump for the duration of the
+      // gesture. Calling marker.setIcon() while GMS is in the middle of
+      // a zoom/pinch animation interleaves marker texture updates with
+      // map composition, which manifests as the visible flicker users
+      // reported during zoom. Skipping the pump leaves the marker on
+      // its most recent bitmap — React animations continue ticking on
+      // the snapshot view in the background, so the moment the camera
+      // settles we resume from the current animation state.
+      advancedState.cameraMoving = true;
+    });
     map.setOnCameraMoveListener(() -> emitRegion("onRegionChange"));
     map.setOnCameraIdleListener(() -> {
+      advancedState.cameraMoving = false;
       // Forward to AdvancedMarkers cluster manager when present so clusters
       // recompute on idle. Safe to call when no advanced markers are mounted.
       if (advancedState.clusterManager != null) {

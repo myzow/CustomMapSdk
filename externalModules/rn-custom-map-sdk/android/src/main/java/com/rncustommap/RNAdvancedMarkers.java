@@ -140,6 +140,16 @@ public final class RNAdvancedMarkers {
     @Nullable Choreographer.FrameCallback pumpCallback;
     boolean pumpRunning;
     long lastPumpTimeNs;
+    /**
+     * Set while the GoogleMap camera is mid-gesture (drag, pinch-zoom,
+     * rotate, programmatic animation). The pump skips its work while
+     * this is true — marker.setIcon() during GMS camera composition
+     * interleaves texture updates with map rendering and produces
+     * visible flicker. React-side animations on the snapshot views
+     * continue uninterrupted; the pump simply resumes on the next
+     * Choreographer frame after camera idle.
+     */
+    volatile boolean cameraMoving;
     boolean usingClusterManager = true;
   }
 
@@ -442,9 +452,17 @@ public final class RNAdvancedMarkers {
         if (!state.pumpRunning) return;
         choreographer.postFrameCallback(this);
 
+        // Pause work entirely while GMS is mid-gesture (drag/zoom/pinch).
+        // The next pump tick after camera idle resumes from the current
+        // animation state on the still-running snapshot views.
+        if (state.cameraMoving) {
+          state.lastPumpTimeNs = frameTimeNanos;
+          return;
+        }
+
         if (state.lastPumpTimeNs != 0
             && frameTimeNanos - state.lastPumpTimeNs < PUMP_INTERVAL_NS) {
-          return; // throttle to ~30 FPS
+          return; // vsync throttle
         }
         state.lastPumpTimeNs = frameTimeNanos;
 

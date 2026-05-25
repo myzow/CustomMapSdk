@@ -30,6 +30,13 @@ using namespace facebook::react;
  * the last live marker is removed. Throttled to ~30 FPS.
  */
 @property (nonatomic, strong, nullable) CADisplayLink *advancedPumpLink;
+/**
+ * YES while the GMS camera is mid-gesture (drag, pinch-zoom, rotate,
+ * animateToCamera) — the pump skips its work in this window to avoid
+ * interleaving marker.icon swaps with GMS camera composition. Cleared
+ * in mapView:idleAtCameraPosition:.
+ */
+@property (nonatomic, assign) BOOL advancedCameraMoving;
 /** GMUClusterManager kept for spec-compliance and cross-platform parity. */
 @property (nonatomic, strong, nullable) id clusterManager;
 @property (nonatomic, copy, nullable) NSString *currentMapId;
@@ -627,6 +634,14 @@ using namespace facebook::react;
 
 - (void)pumpAdvancedLiveMarkers:(CADisplayLink *)sender
 {
+  // Skip work entirely while GMS is mid-gesture (drag/pinch/zoom/
+  // animate). Interleaving marker.icon updates with camera composition
+  // is the root cause of the visible flicker users see during zoom.
+  // React animations on the snapshot views continue running in the
+  // background, so the next post-idle pump tick resumes from the
+  // current animation state.
+  if (self.advancedCameraMoving) return;
+
   // One synchronous Core Animation commit at the start of the pump
   // tick — flushes all pending animation state (useNativeDriver
   // transforms, Lottie frame advances, ActivityIndicator rotation)
@@ -1005,6 +1020,14 @@ using namespace facebook::react;
 - (void)mapView:(GMSMapView *)mapView willMove:(BOOL)gesture
 {
   self.lastRegionChangeWasGesture = gesture;
+  // Pause the AdvancedMarker live-pump for the duration of the camera
+  // animation. Calling marker.icon = ... while GMS is mid-zoom/pinch
+  // interleaves marker texture swaps with map composition — the visible
+  // result is the flicker users reported during zoom. The React
+  // animations on the snapshot views continue ticking in the
+  // background; the next pump frame after idle captures the current
+  // state seamlessly.
+  self.advancedCameraMoving = YES;
 }
 
 - (void)mapView:(GMSMapView *)mapView didChangeCameraPosition:(GMSCameraPosition *)position
@@ -1016,6 +1039,7 @@ using namespace facebook::react;
 
 - (void)mapView:(GMSMapView *)mapView idleAtCameraPosition:(GMSCameraPosition *)position
 {
+  self.advancedCameraMoving = NO;
   if (self.onRegionChangeComplete) {
     self.onRegionChangeComplete(@{@"region": [self regionPayload], @"details": @{@"isGesture": @(self.lastRegionChangeWasGesture)}});
   }

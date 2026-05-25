@@ -27,6 +27,8 @@ Android: "addViewAt: failed to insert view [N] into parent [M] at index K"
 
 - **Unmount safety**: JS dispatches a `-1` sentinel to `setAdvancedMarkerView` when React's ref returns null. Native drops the cached snapshot reference before RN deallocates the UIView/View, so the pump never tries to draw against a zombie pointer.
 
+- **Gesture-aware pump (Issue 8)**. Calling `marker.setIcon` while GMS is in the middle of a zoom/pinch/drag animation interleaves marker texture updates with map composition — the visible result is a flicker on each new frame. Fixed by gating the pump on a `cameraMoving` / `advancedCameraMoving` flag set in `OnCameraMoveStartedListener` (Android) / `mapView:willMove:` (iOS) and cleared in `OnCameraIdleListener` / `mapView:idleAtCameraPosition:`. The React animations on the snapshot views keep running in the background; the next pump tick after camera idle resumes from the current animation state seamlessly.
+
 - **No reparenting of React views — at all.** RN-Fabric-safe by construction.
 
 ---
