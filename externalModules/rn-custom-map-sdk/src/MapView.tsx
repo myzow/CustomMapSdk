@@ -1084,6 +1084,9 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
               hasCustomView: true,
               isCluster: true,
               anchor: { x: 0.5, y: 0.5 },
+              // Cluster bubbles are static — route through the GMS-side
+              // bitmap path (zero compositor lag, no live pump churn).
+              tracksViewChanges: false,
             } as NativeAdvancedMarker;
           },
           makeClusterSnapshot: (cluster, syntheticId) => {
@@ -1146,6 +1149,53 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       advancedClusterSnapshots,
       advancedPassthroughIds,
     ]);
+
+    /**
+     * Per-marker `tracksViewChanges` lookup. The default is `true` (live
+     * overlay path). `false` opts the marker into the GMS-side bitmap
+     * path — rendered on the same GL surface as the map tiles, so
+     * pan/zoom is perfectly synced with zero compositor lag. Static
+     * markers and high-density scenes should use `false`.
+     *
+     * Cluster bubbles (synthetic ids prefixed with `acluster:`) default
+     * to `false` because the bubble itself is static and benefits from
+     * the synced bitmap path.
+     */
+    const advancedTracksChanges = useMemo(() => {
+      const map = new Map<string, boolean>();
+      for (const m of parsed.advancedMarkers) {
+        map.set(m.id, m.tracksViewChanges !== false);
+      }
+      return map;
+    }, [parsed.advancedMarkers]);
+
+    /**
+     * Split advanced snapshots into:
+     *  - `liveOverlaySnapshots` — rendered as REAL React views in the
+     *    absolute overlay layer. Live animations play at native frame
+     *    rate. Native projects coord → screen pixels every camera tick.
+     *  - `staticBitmapSnapshots` — rendered in an off-screen subtree
+     *    and rasterized into a GMS BitmapDescriptor (Android) / UIImage
+     *    (iOS) via `setAdvancedMarkerView`. GMS renders the bitmap on
+     *    its own GL surface, perfectly synced with the map — zero lag,
+     *    zero flicker during pan/zoom.
+     *
+     * Cluster bubbles always go to the bitmap path (they don't animate
+     * and the bitmap path is flicker-free during cluster recomputes).
+     */
+    const { liveOverlaySnapshots, staticBitmapSnapshots } = useMemo(() => {
+      const live: MarkerSnapshot[] = [];
+      const stat: MarkerSnapshot[] = [];
+      for (const s of advancedSnapshots) {
+        // Snapshots not in `advancedTracksChanges` are synthetic cluster
+        // bubbles → route to bitmap path (cluster bubbles are not
+        // typically animated and bitmap renders flicker-free).
+        const tracks = advancedTracksChanges.get(s.id);
+        if (tracks === false || tracks === undefined) stat.push(s);
+        else live.push(s);
+      }
+      return { liveOverlaySnapshots: live, staticBitmapSnapshots: stat };
+    }, [advancedSnapshots, advancedTracksChanges]);
 
     // ------------------------------------------------------------------
     // Marker view (snapshot) wiring — classic
@@ -1221,7 +1271,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
       if (isDragging) return;
       const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
       if (typeof fn !== 'function') return;
-      advancedSnapshots.forEach(({ id }) => {
+      staticBitmapSnapshots.forEach(({ id }) => {
         const tagId = advancedMarkerViewTags.current.get(id);
         if (tagId != null) {
           try {
@@ -1231,7 +1281,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
           }
         }
       });
-    }, [getReactTag, advancedSnapshots, nativeAdvancedMarkers, isDragging]);
+    }, [getReactTag, staticBitmapSnapshots, nativeAdvancedMarkers, isDragging]);
 
     // ------------------------------------------------------------------
     // Container layout — tracks viewport pixel dimensions
@@ -1360,7 +1410,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     useEffect(() => {
       const fn = (NativeMapViewManager as any).setMarkerOverlay;
       if (typeof fn !== 'function') return;
-      advancedSnapshots.forEach(({ id }) => {
+      liveOverlaySnapshots.forEach(({ id }) => {
         const tag = overlayViewTags.current.get(id);
         if (tag == null) return;
         const meta = parsed.advancedMarkerMeta.get(id);
@@ -1379,7 +1429,7 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
           /* race */
         }
       });
-    }, [getReactTag, advancedSnapshots, parsed.advancedMarkerMeta]);
+    }, [getReactTag, liveOverlaySnapshots, parsed.advancedMarkerMeta]);
 
     return (
       <View style={styles.container} onLayout={onContainerLayout}>
@@ -1484,28 +1534,32 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
         ) : null}
 
         {/*
-          Native-synced overlay layer (Uber/Life360 pattern). Each
-          advanced marker's custom React subtree is rendered here as a
-          real RN view — animations play at native frame rate because the
-          view is in a live view hierarchy, not a periodic bitmap
-          snapshot. Native re-projects the marker's lat/lng to screen
-          pixels on every camera frame and writes
-          view.setTranslationX/Y / view.center directly, so the overlay
-          tracks the map pixel-perfectly during drag/zoom with zero
-          flicker, zero setIcon calls, zero red-pin flash.
+          Native-synced overlay layer (Uber/Life360 pattern). ONLY
+          markers with `tracksViewChanges` left at the default `true`
+          land here — those that want live animations (Lottie /
+          Animated.View / ActivityIndicator / Reanimated). Native
+          re-projects the marker's lat/lng to screen pixels on every
+          camera frame and writes view.setTranslationX/Y / view.center
+          directly. UIKit/Android's compositor introduces a possible
+          ~1 frame lag during very fast pan/zoom — that's the trade-off
+          for live native-frame-rate animations.
+
+          For zero-lag, perfectly-synced markers (Uber driver dot,
+          static avatar pins), set `tracksViewChanges={false}` on the
+          AdvancedMarker — those go to the GMS-side bitmap path below,
+          which is rendered on the same GL surface as the map tiles.
 
           pointerEvents="box-none" — the layer itself doesn't intercept
-          touches, but child marker views do (use TouchableOpacity etc.
-          inside your marker to handle press).
+          touches, but child marker views do (Pressable wraps each).
         */}
         {(Platform.OS === 'android' || Platform.OS === 'ios') &&
-        advancedSnapshots.length > 0 ? (
+        liveOverlaySnapshots.length > 0 ? (
           <View
             pointerEvents="box-none"
             style={StyleSheet.absoluteFill}
             collapsable={false}
           >
-            {advancedSnapshots.map(snapshot => {
+            {liveOverlaySnapshots.map(snapshot => {
               const meta = parsed.advancedMarkerMeta.get(snapshot.id);
               if (!meta) return null;
               const onPress = parsed.markerPressHandlers.get(snapshot.id);
@@ -1562,6 +1616,43 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
                 </View>
               );
             })}
+          </View>
+        ) : null}
+
+        {/*
+          Static-bitmap advanced markers — `tracksViewChanges={false}`.
+          Routed through the off-screen snapshot subtree and rasterized
+          into a GMS BitmapDescriptor / UIImage via
+          setAdvancedMarkerView. The GMS marker itself renders the
+          bitmap on its own GL surface, perfectly synced with the map
+          tiles — zero compositor lag, zero flicker during pan/zoom.
+          Cluster bubbles also land here (they don't animate and benefit
+          from the synced bitmap path on cluster recompute).
+        */}
+        {(Platform.OS === 'android' || Platform.OS === 'ios') &&
+        staticBitmapSnapshots.length > 0 ? (
+          <View pointerEvents="none" style={styles.markerSnapshotRoot}>
+            {staticBitmapSnapshots.map(snapshot => (
+              <View
+                key={`adv-static-${snapshot.id}`}
+                ref={node => setAdvancedMarkerView(snapshot.id, node)}
+                collapsable={false}
+                renderToHardwareTextureAndroid
+                onLayout={() => {
+                  const tagId = advancedMarkerViewTags.current.get(snapshot.id);
+                  const fn = (NativeMapViewManager as any).setAdvancedMarkerView;
+                  if (tagId != null && typeof fn === 'function') {
+                    try {
+                      fn(getReactTag(), snapshot.id, tagId);
+                    } catch {
+                      /* race */
+                    }
+                  }
+                }}
+              >
+                {snapshot.children}
+              </View>
+            ))}
           </View>
         ) : null}
       </View>

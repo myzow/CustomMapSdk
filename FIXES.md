@@ -6,6 +6,65 @@ Google Maps `MapView` instances.
 
 ---
 
+## Issue 11 — `tracksViewChanges={false}` markers still flickering after overlay refactor
+
+**Symptom.** A consumer sets `tracksViewChanges={false}` on an
+`<AdvancedMarker>` containing animated children (e.g.
+`<CustomActivityIndicator/>`) and still sees flicker / jitter during
+pan/zoom.
+
+**Root cause.** Issue 10's native-synced overlay refactor unconditionally
+routed every advanced-marker subtree into the React overlay layer —
+ignoring the marker's `tracksViewChanges` prop. The result was two
+concurrent visuals per marker:
+
+1. A hidden GMS marker (`opacity=0`, `pendingReveal=YES`) — never
+   revealed because `setAdvancedMarkerView` was never called after the
+   refactor. So far so good.
+2. The React overlay UIView/Android View in an absolute-positioned
+   layer above the map. Repositioned via `setMarkerOverlay` in
+   `didChangeCameraPosition:` / `onCameraMove(...)`.
+
+The flicker comes from #2. The map renders on its own GL surface; the
+React overlay sits in the UIKit / Android view compositor. Even though
+native sets `view.center` (iOS) / `setTranslationX/Y` (Android)
+synchronously inside the camera-move callback, those property writes
+are committed on the **next** display refresh — so during fast pan/zoom
+the overlay lags the map by ~1 frame and appears to swim.
+
+`tracksViewChanges={false}` was supposed to provide an opt-out into the
+GMS-side bitmap path (rendered on the same GL surface as the map tiles,
+zero compositor lag). After the refactor the opt-out was a no-op.
+
+**Fix.** `MapView.tsx` now splits advanced-marker snapshots into two
+buckets based on `tracksViewChanges`:
+
+| Bucket | Path | Renders | Trade-off |
+|---|---|---|---|
+| `liveOverlaySnapshots` (default, `tracksViewChanges !== false`) | Overlay layer above the map | Real React views, live animations at native frame rate | Up to ~1 frame of compositor lag during very fast pan/zoom |
+| `staticBitmapSnapshots` (`tracksViewChanges === false` + all cluster bubbles) | GMS-side bitmap (BitmapDescriptor / UIImage) via `setAdvancedMarkerView` | Static snapshot rendered on the map's own GL surface | Zero compositor lag, perfectly synced with map; no live animations |
+
+Cluster bubbles now also carry `tracksViewChanges: false` explicitly so
+the synthetic cluster marker rides the bitmap path (no pump churn on
+cluster recompute).
+
+### Files touched
+- `externalModules/rn-custom-map-sdk/src/MapView.tsx` —
+  - new `advancedTracksChanges` lookup,
+  - new split into `liveOverlaySnapshots` / `staticBitmapSnapshots`,
+  - JSX now renders **two** subtrees: the overlay layer + the
+    off-screen advanced-marker bitmap root,
+  - cluster bubble factory emits `tracksViewChanges: false`.
+
+### How to choose
+- "I want my marker glued to the map at 60FPS, no animation" →
+  `tracksViewChanges={false}` (recommended for driver dots, avatar pins,
+  static labels — the user's case in this thread).
+- "I want my marker to play a live animation (pulse, Lottie, spinner,
+  Reanimated)" → leave `tracksViewChanges` at default (`true`).
+
+---
+
 ## Issue 10 — Uber/Life360 quality: native-synced overlay markers
 
 **Previous approaches and their limits.**
