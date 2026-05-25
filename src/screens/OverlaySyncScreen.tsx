@@ -267,6 +267,30 @@ export default function OverlaySyncScreen() {
     Alert.alert('Marker pressed', `${d.label}\n${d.coordinate.latitude.toFixed(4)}, ${d.coordinate.longitude.toFixed(4)}`);
   }, []);
 
+  /**
+   * Wrapped-component pattern — exercises the Context-based
+   * AdvancedMarker registration. The map's child walker can't see
+   * inside this functional component, but the AdvancedMarker inside
+   * still registers itself with the parent MapView via context.
+   *
+   * Both this and the inline pattern (below) must render markers
+   * correctly.
+   */
+  const WrappedPin = useCallback(
+    ({ driver }: { driver: Driver }) => (
+      <AdvancedMarker
+        identifier={`wrapped-${driver.id}`}
+        coordinate={driver.coordinate}
+        data={driver}
+        title={`(wrapped) ${driver.label}`}
+        onPress={() => handleMarkerPress(driver)}
+      >
+        <MarkerContent kind={driver.kind} color={driver.color} label={driver.label} />
+      </AdvancedMarker>
+    ),
+    [handleMarkerPress],
+  );
+
   const recenter = useCallback(() => {
     mapRef.current?.animateToRegion(
       {
@@ -282,10 +306,10 @@ export default function OverlaySyncScreen() {
   return (
     <View style={styles.root}>
       <View style={styles.banner}>
-        <Text style={styles.bannerTitle}>Overlay Sync Test</Text>
+        <Text style={styles.bannerTitle}>Overlay Sync + HOC Test</Text>
         <Text style={styles.bannerSub}>
-          5 live drivers (top) + 12-pin cluster (bottom). Drivers' coords
-          mutate every 500ms; markers must stay pinned to the map at 60fps.
+          5 inline drivers + 2 wrapped-in-HOC drivers + 12-pin cluster.
+          Both patterns must render and stay pinned to the map at 60fps.
         </Text>
       </View>
 
@@ -301,6 +325,7 @@ export default function OverlaySyncScreen() {
         }}
         clusterConfig={{ enabled: true, radius: 60 }}
       >
+        {/* Inline pattern: AdvancedMarker as a direct child of MapView */}
         {allDrivers.map(d => (
           <AdvancedMarker
             key={d.id}
@@ -312,6 +337,27 @@ export default function OverlaySyncScreen() {
           >
             <MarkerContent kind={d.kind} color={d.color} label={d.label} />
           </AdvancedMarker>
+        ))}
+
+        {/*
+          Wrapped pattern: an AdvancedMarker nested inside a custom
+          component. The map's child walker can't see inside WrappedPin
+          (it's a functional component), but AdvancedMarker registers
+          via React Context and the map renders it correctly.
+        */}
+        {drivers.slice(0, 2).map(d => (
+          <WrappedPin
+            key={`w-${d.id}`}
+            driver={{
+              ...d,
+              // Offset slightly so the wrapped pins don't overlap the
+              // inline ones — visually clear that both are rendered.
+              coordinate: {
+                latitude: d.coordinate.latitude + 0.005,
+                longitude: d.coordinate.longitude,
+              },
+            }}
+          />
         ))}
       </MapView>
 

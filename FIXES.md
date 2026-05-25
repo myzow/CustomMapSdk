@@ -6,6 +6,80 @@ Google Maps `MapView` instances.
 
 ---
 
+## Issue 12 — `<AdvancedMarker>` wrapped in a custom component renders nothing
+
+**Symptom.**
+
+```jsx
+const MyPin = ({ user }) => (
+  <AdvancedMarker identifier={user.id} coordinate={...}>
+    <Avatar uri={user.avatar} />
+  </AdvancedMarker>
+);
+
+// Inside the consumer:
+<MapView>
+  {users.map(u => <MyPin key={u.id} user={u} />)}
+</MapView>
+```
+
+Zero markers are drawn even though the data is correct.
+
+**Root cause.** `<AdvancedMarker>` is a virtual node (returns `null`)
+and the parent `<MapView>` discovers markers by walking the JSX tree
+inside `parseChildren`. The walker can transparently descend through
+`<View>` and `<Fragment>` wrappers because those expose their tree via
+`props.children`, but it **cannot descend into a custom functional or
+forwardRef component**: the component's render output is opaque from
+the parent's perspective (functions can use hooks; calling them
+outside React's reconciler corrupts hook state). `MyPin.props.children`
+is undefined → the walker has nothing to recurse into → no marker.
+
+**Fix.** Added a React Context (`MapContext`) exported by the parent
+`<MapView>`. `<AdvancedMarker>` now does both things:
+
+1. Returns `null` (unchanged — its visual content is hoisted into the
+   MapView's overlay / bitmap subtree, as before).
+2. Registers itself with the context on mount, re-registers on
+   primitive prop changes, unregisters on unmount.
+
+`<MapView>` maintains a state Map of registered markers, merges it
+with the inline `parseChildren` result (registry wins on id collision
+because it has the most up-to-date children reference), and renders
+from the merged data. The consumer's JSX is rendered inside an
+invisible host (`registryHost`, `0x0` clipped) so any descendant
+`<AdvancedMarker>` mounts and runs its registration effect.
+
+### Both patterns now work
+```jsx
+// Inline children — handled by parseChildren on the first render
+<MapView>
+  <AdvancedMarker coordinate={...}>
+    <View />
+  </AdvancedMarker>
+</MapView>
+
+// Wrapped in ANY HOC / fragment / conditional render — handled by
+// context registration after the first effect flush
+<MapView>
+  {users.map(u => <MyPin key={u.id} user={u} />)}
+</MapView>
+```
+
+### Files touched
+- `externalModules/rn-custom-map-sdk/src/AdvancedMarkerContext.ts` — new file: context + types.
+- `externalModules/rn-custom-map-sdk/src/AdvancedMarker.tsx` — full rewrite: registers via context.
+- `externalModules/rn-custom-map-sdk/src/MapView.tsx` — adds state Map + context provider + merge logic + invisible registryHost that mounts `children`.
+- `externalModules/rn-custom-map-sdk/index.tsx` — re-exports `MapContext`.
+- `src/screens/OverlaySyncScreen.tsx` — adds a wrapped-pin demo.
+
+### Notes
+- Inline pattern still renders on the first frame (parseChildren handles it).
+- Wrapped pattern shows markers after the first effect flush (one extra render cycle — typically ~1 frame).
+- Empty / missing `identifier` falls back to an auto-generated stable id.
+
+---
+
 ## Issue 11 — `tracksViewChanges={false}` markers still flickering after overlay refactor
 
 **Symptom.** A consumer sets `tracksViewChanges={false}` on an

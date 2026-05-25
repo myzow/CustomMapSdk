@@ -40,6 +40,11 @@ import { DragGate } from './clustering/dragGate';
 import { stableClusterKey } from './clustering/membership';
 import { resolveCluster } from './clustering/markerType';
 import { defaultIconCache } from './clustering/iconCache';
+import {
+  MapContext,
+  type AdvancedMarkerRegistration,
+  type MapContextValue,
+} from './AdvancedMarkerContext';
 import type {
   AdvancedMarkerProps,
   Camera,
@@ -465,8 +470,144 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     const nativeRef = useRef<React.ElementRef<typeof NativeMapView>>(null);
     const markerViewTags = useRef(new Map<string, number>());
     const advancedMarkerViewTags = useRef(new Map<string, number>());
-    const parsed = useMemo(() => parseChildren(children), [children]);
+    const inlineParsed = useMemo(() => parseChildren(children), [children]);
     const resolvedMapId = mapId ?? DEFAULT_MAP_ID;
+
+    // -----------------------------------------------------------------
+    // Context-based <AdvancedMarker> registration.
+    //
+    // The inline JSX pattern <MapView><AdvancedMarker .../></MapView>
+    // is handled by parseChildren above. The wrapped pattern
+    // <MapView><MyDriverPin /></MapView> (where MyDriverPin renders
+    // an AdvancedMarker internally) flows through this registry.
+    //
+    // Both sources are merged into `parsed` below. Registry entries
+    // win on id collision because they have the most up-to-date
+    // children reference.
+    // -----------------------------------------------------------------
+    const [registeredAdvancedMarkers, setRegisteredAdvancedMarkers] =
+      useState<Map<string, AdvancedMarkerRegistration>>(() => new Map());
+
+    const mapContextValue = useMemo<MapContextValue>(
+      () => ({
+        upsertAdvancedMarker(id, entry) {
+          setRegisteredAdvancedMarkers(prev => {
+            const next = new Map(prev);
+            next.set(id, entry);
+            return next;
+          });
+        },
+        removeAdvancedMarker(id) {
+          setRegisteredAdvancedMarkers(prev => {
+            if (!prev.has(id)) return prev;
+            const next = new Map(prev);
+            next.delete(id);
+            return next;
+          });
+        },
+      }),
+      [],
+    );
+
+    /**
+     * Merge the inline `parseChildren` result with markers contributed
+     * by the registry. The merged shape mirrors `parseChildren`'s so
+     * the rest of the component doesn't need to know whether a marker
+     * came from inline JSX or from a wrapped component.
+     */
+    const parsed = useMemo(() => {
+      if (registeredAdvancedMarkers.size === 0) return inlineParsed;
+
+      // Clone the per-id collections so we don't mutate parseChildren's
+      // output. Shallow clones are sufficient — values are leaf data.
+      const advancedMarkers = [...inlineParsed.advancedMarkers];
+      const advancedMarkerSnapshots = [...inlineParsed.advancedMarkerSnapshots];
+      const advancedMarkerMeta = new Map(inlineParsed.advancedMarkerMeta);
+      const markerPressHandlers = new Map(inlineParsed.markerPressHandlers);
+      const markerSelectHandlers = new Map(inlineParsed.markerSelectHandlers);
+      const markerDeselectHandlers = new Map(inlineParsed.markerDeselectHandlers);
+      const markerDragStartHandlers = new Map(
+        inlineParsed.markerDragStartHandlers,
+      );
+      const markerDragHandlers = new Map(inlineParsed.markerDragHandlers);
+      const markerDragEndHandlers = new Map(inlineParsed.markerDragEndHandlers);
+
+      const advIdxById = new Map<string, number>();
+      advancedMarkers.forEach((m, i) => advIdxById.set(m.id, i));
+      const snapIdxById = new Map<string, number>();
+      advancedMarkerSnapshots.forEach((s, i) => snapIdxById.set(s.id, i));
+
+      for (const [id, entry] of registeredAdvancedMarkers) {
+        const p = entry.props;
+        const customChildren = entry.children;
+        const hasCustomView =
+          customChildren != null &&
+          !(Array.isArray(customChildren) && customChildren.length === 0);
+
+        const native: NativeAdvancedMarker = {
+          id,
+          latitude: p.coordinate.latitude,
+          longitude: p.coordinate.longitude,
+          title: p.title,
+          description: p.description,
+          pinColor: p.pinColor,
+          draggable: p.draggable,
+          flat: p.flat,
+          rotation: p.rotation,
+          opacity: p.opacity,
+          anchor: p.anchor,
+          zIndex: p.zIndex,
+          hasCustomView,
+          tracksViewChanges: p.tracksViewChanges,
+        };
+
+        const advIdx = advIdxById.get(id);
+        if (advIdx != null) advancedMarkers[advIdx] = native;
+        else {
+          advIdxById.set(id, advancedMarkers.length);
+          advancedMarkers.push(native);
+        }
+
+        if (hasCustomView) {
+          const snap = { id, children: customChildren };
+          const snapIdx = snapIdxById.get(id);
+          if (snapIdx != null) advancedMarkerSnapshots[snapIdx] = snap;
+          else {
+            snapIdxById.set(id, advancedMarkerSnapshots.length);
+            advancedMarkerSnapshots.push(snap);
+          }
+        }
+
+        advancedMarkerMeta.set(id, {
+          id,
+          coordinate: p.coordinate,
+          data: p.data,
+          title: p.title,
+          isCustom: hasCustomView,
+        });
+
+        if (p.onPress) markerPressHandlers.set(id, p.onPress);
+        if (p.onSelect) markerSelectHandlers.set(id, p.onSelect);
+        if (p.onDeselect) markerDeselectHandlers.set(id, p.onDeselect);
+        if (p.onDragStart) markerDragStartHandlers.set(id, p.onDragStart);
+        if (p.onDrag) markerDragHandlers.set(id, p.onDrag);
+        if (p.onDragEnd) markerDragEndHandlers.set(id, p.onDragEnd);
+      }
+
+      return {
+        ...inlineParsed,
+        advancedMarkers,
+        advancedMarkerSnapshots,
+        advancedMarkerMeta,
+        markerPressHandlers,
+        markerSelectHandlers,
+        markerDeselectHandlers,
+        markerDragStartHandlers,
+        markerDragHandlers,
+        markerDragEndHandlers,
+      };
+    }, [inlineParsed, registeredAdvancedMarkers]);
+
 
     const getReactTag = useCallback(() => {
       const tag = findNodeHandle(nativeRef.current);
@@ -1432,8 +1573,25 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
     }, [getReactTag, liveOverlaySnapshots, parsed.advancedMarkerMeta]);
 
     return (
-      <View style={styles.container} onLayout={onContainerLayout}>
-        <NativeMapView
+      <MapContext.Provider value={mapContextValue}>
+        <View style={styles.container} onLayout={onContainerLayout}>
+          {/*
+            Invisible host for `children`. Renders the consumer's
+            JSX tree so any nested <AdvancedMarker> mounts and can
+            register via context. Returns null itself (each
+            <AdvancedMarker> returns null), and the children prop is
+            ignored on classic Map elements (they're virtual too).
+            Wrapping in `position: absolute; width:0; height:0` keeps
+            the host inert visually.
+          */}
+          <View
+            collapsable={false}
+            pointerEvents="none"
+            style={styles.registryHost}
+          >
+            {children}
+          </View>
+          <NativeMapView
           ref={nativeRef}
           {...props}
           mapId={resolvedMapId}
@@ -1655,7 +1813,8 @@ const MapView = forwardRef<MapViewMethods, MapViewProps>(
             ))}
           </View>
         ) : null}
-      </View>
+        </View>
+      </MapContext.Provider>
     );
   },
 );
@@ -1664,6 +1823,18 @@ MapView.displayName = 'RNCustomMapView';
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
+  /**
+   * Off-screen host that mounts the consumer's JSX subtree so any
+   * descendant `<AdvancedMarker>` can register via context. Zero
+   * size, no pointer events, never visible.
+   */
+  registryHost: {
+    position: 'absolute',
+    width: 0,
+    height: 0,
+    overflow: 'hidden',
+    opacity: 0,
+  },
   markerSnapshotRoot: {
     position: 'absolute',
     left: -10000,

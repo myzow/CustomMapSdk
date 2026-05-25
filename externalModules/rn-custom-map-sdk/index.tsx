@@ -5,6 +5,11 @@ export { default as Callout } from './src/Callout';
 export { default as Polyline } from './src/Polyline';
 export { default as Circle } from './src/Circle';
 export { default as MarkerPlaceholder } from './src/Placeholder';
+export { MapContext } from './src/AdvancedMarkerContext';
+export type {
+  AdvancedMarkerRegistration,
+  MapContextValue,
+} from './src/AdvancedMarkerContext';
 export { useMapTabLifecycle } from './src/hooks/useMapTabLifecycle';
 export { clusterPoints } from './src/clustering/cluster';
 export {
