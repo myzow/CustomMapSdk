@@ -25,6 +25,18 @@ using namespace facebook::react;
 /** Per-marker tracksViewChanges preference (default YES if absent). */
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *advancedTracksChanges;
 /**
+ * Marker ids whose GMSAdvancedMarker has been created but whose React
+ * snapshot view has not yet been rasterized into the icon. These markers
+ * are kept at opacity 0 so neither the default GMS pin nor the
+ * transparent placeholder is visible during the 50–200ms gap between
+ * marker creation and the arrival of the first setAdvancedMarkerView
+ * callback. Without this, cluster recomputes on drag/zoom-idle
+ * produced a brief red-pin flash users called out as flicker.
+ */
+@property (nonatomic, strong) NSMutableSet<NSString *> *advancedPendingReveal;
+/** Per-marker requested opacity captured so reveal restores user intent. */
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *advancedRequestedOpacity;
+/**
  * Single CADisplayLink that drives the live-marker rasterization pump.
  * Allocated lazily when the first live marker arrives, invalidated when
  * the last live marker is removed. Throttled to ~30 FPS.
@@ -64,6 +76,8 @@ using namespace facebook::react;
     _advancedIconViews = [NSMutableDictionary new];
     _advancedLiveMarkers = [NSMutableSet new];
     _advancedTracksChanges = [NSMutableDictionary new];
+    _advancedPendingReveal = [NSMutableSet new];
+    _advancedRequestedOpacity = [NSMutableDictionary new];
     _currentMapId = @"DEMO_MAP_ID";
     _mapPolylines = [NSMutableArray new];
     _mapCircles = [NSMutableArray new];
@@ -361,6 +375,8 @@ using namespace facebook::react;
     [self.advancedIconViews removeObjectForKey:removedId];
     [self.advancedLiveMarkers removeObject:removedId];
     [self.advancedTracksChanges removeObjectForKey:removedId];
+    [self.advancedPendingReveal removeObject:removedId];
+    [self.advancedRequestedOpacity removeObjectForKey:removedId];
   }
   [self updateAdvancedPumpRunning];
 
@@ -391,7 +407,15 @@ using namespace facebook::react;
       marker.draggable = [RCTConvert BOOL:item[@"draggable"]];
       marker.flat = [RCTConvert BOOL:item[@"flat"]];
       marker.rotation = item[@"rotation"] ? [item[@"rotation"] doubleValue] : marker.rotation;
-      marker.opacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : marker.opacity;
+      // Track requested opacity so the eventual reveal restores it.
+      // Don't push it onto the marker while pendingReveal is set —
+      // that would un-hide the marker before its real icon lands and
+      // bring back the placeholder flash.
+      float requestedOpacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : marker.opacity;
+      self.advancedRequestedOpacity[identifier] = @(requestedOpacity);
+      if (![self.advancedPendingReveal containsObject:identifier]) {
+        marker.opacity = requestedOpacity;
+      }
       marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:marker.groundAnchor];
       marker.zIndex = item[@"zIndex"] ? [item[@"zIndex"] intValue] : marker.zIndex;
       // For markers without a custom view, refresh the pinColor-tinted
@@ -409,17 +433,26 @@ using namespace facebook::react;
     marker.draggable = [RCTConvert BOOL:item[@"draggable"]];
     marker.flat = [RCTConvert BOOL:item[@"flat"]];
     marker.rotation = item[@"rotation"] ? [item[@"rotation"] doubleValue] : 0;
-    marker.opacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : 1;
+    float desiredOpacity = item[@"opacity"] ? [item[@"opacity"] floatValue] : 1;
+    self.advancedRequestedOpacity[identifier] = @(desiredOpacity);
     marker.groundAnchor = [self pointFromDictionary:item[@"anchor"] fallback:CGPointMake(0.5, 1)];
     marker.zIndex = item[@"zIndex"] ? [item[@"zIndex"] intValue] : 0;
     marker.userData = identifier;
     if (hasCustomView) {
-      // Transparent placeholder so the default pin never flashes. The
-      // real bitmap arrives via -setAdvancedMarkerView:markerId: shortly.
+      // Hide the marker entirely (opacity 0) until -setAdvancedMarkerView:
+      // delivers the first real icon. Without this, GMS briefly
+      // renders the default red pin (or our transparent placeholder,
+      // depending on internal state) in the 50–200ms gap between
+      // marker creation and the snapshot view mounting on the JS side.
+      // That was the cluster-recompute flicker users reported on
+      // drag/zoom-end.
       marker.icon = [self transparentPlaceholderImage];
+      marker.opacity = 0;
+      [self.advancedPendingReveal addObject:identifier];
       marker.tracksViewChanges = NO;
     } else {
       marker.icon = [self advancedDefaultPinForItem:item];
+      marker.opacity = desiredOpacity;
     }
     marker.map = self.mapView;
     self.advancedMarkersById[identifier] = marker;
@@ -576,6 +609,13 @@ using namespace facebook::react;
         marker.groundAnchor = CGPointMake(0.5, 1);
         marker.tracksViewChanges = NO;
       }
+      // Always honour a pending reveal — the cache hit means we have
+      // a valid icon, even if the marker setter was a no-op above.
+      if ([self.advancedPendingReveal containsObject:markerId]) {
+        [self.advancedPendingReveal removeObject:markerId];
+        NSNumber *requested = self.advancedRequestedOpacity[markerId];
+        marker.opacity = requested ? requested.floatValue : 1.0f;
+      }
       return;
     }
   }
@@ -599,6 +639,13 @@ using namespace facebook::react;
   marker.icon = image;
   marker.groundAnchor = CGPointMake(0.5, 1);
   marker.tracksViewChanges = NO;
+  // First real icon for this marker — reveal it. Subsequent
+  // rasterizations (pump ticks) leave opacity alone.
+  if ([self.advancedPendingReveal containsObject:markerId]) {
+    [self.advancedPendingReveal removeObject:markerId];
+    NSNumber *requested = self.advancedRequestedOpacity[markerId];
+    marker.opacity = requested ? requested.floatValue : 1.0f;
+  }
 }
 
 /**

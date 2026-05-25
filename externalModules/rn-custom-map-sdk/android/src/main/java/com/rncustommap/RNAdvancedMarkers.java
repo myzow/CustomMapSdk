@@ -141,6 +141,20 @@ public final class RNAdvancedMarkers {
     boolean pumpRunning;
     long lastPumpTimeNs;
     /**
+     * Marker ids whose AdvancedMarker has been created but whose React
+     * snapshot view has not yet been rasterized into the icon. These
+     * markers are kept at {@code alpha = 0} so the default Maps SDK pin
+     * (or our 1x1 transparent placeholder, depending on platform path)
+     * is never visible during the gap between {@code addMarker(...)} and
+     * the first {@code setIcon(...)} arrival. Without this, cluster
+     * recomputes on drag/zoom-idle produced a brief 200–500ms "red pin
+     * flash" — exactly the symptom users reported as the post-gesture
+     * marker flicker.
+     */
+    final Set<String> pendingReveal = new HashSet<>();
+    /** Per-marker requested opacity (so reveal restores the user value). */
+    final Map<String, Float> requestedOpacity = new HashMap<>();
+    /**
      * Set while the GoogleMap camera is mid-gesture (drag, pinch-zoom,
      * rotate, programmatic animation). The pump skips its work while
      * this is true — marker.setIcon() during GMS camera composition
@@ -251,7 +265,15 @@ public final class RNAdvancedMarkers {
           float rotation = (float) getDouble(item, "rotation", existing.getRotation());
           if (rotation != existing.getRotation()) existing.setRotation(rotation);
           float alpha = (float) getDouble(item, "opacity", existing.getAlpha());
-          if (alpha != existing.getAlpha()) existing.setAlpha(alpha);
+          // Always track the user's requested opacity so the eventual
+          // reveal (when this marker's first iconView arrives) picks it
+          // up. Don't actually setAlpha while pendingReveal is true —
+          // that would un-hide the marker before its real icon is in
+          // place and re-introduce the placeholder flash.
+          state.requestedOpacity.put(id, alpha);
+          if (!state.pendingReveal.contains(id) && alpha != existing.getAlpha()) {
+            existing.setAlpha(alpha);
+          }
           existing.setAnchor(anchorU(item), anchorV(item));
           existing.setZIndex((int) getDouble(item, "zIndex", existing.getZIndex()));
           // Live-pump membership may have toggled.
@@ -284,6 +306,23 @@ public final class RNAdvancedMarkers {
         if (created != null) {
           created.setTag(id);
           state.markers.put(id, created);
+
+          // Capture the user's requested opacity and HIDE the marker
+          // until its real icon arrives. This is the fix for the red-
+          // pin-flash on drag/zoom-end: cluster recomputes destroy and
+          // re-create the marker, and there's a 50–200ms gap before
+          // React mounts the new snapshot view and we receive the
+          // setAdvancedMarkerView callback. During that gap an alpha=1
+          // marker shows whatever placeholder the SDK provides, which
+          // is visually disruptive. alpha=0 makes the gap invisible.
+          float desiredAlpha = (float) getDouble(item, "opacity", 1.0);
+          state.requestedOpacity.put(id, desiredAlpha);
+          if (hasCustomView) {
+            try {
+              created.setAlpha(0f);
+              state.pendingReveal.add(id);
+            } catch (RuntimeException ignored) {}
+          }
 
           // If the snapshot view already arrived (queue ordering), apply
           // it now so the placeholder doesn't flash.
@@ -405,6 +444,12 @@ public final class RNAdvancedMarkers {
     try {
       marker.setIcon(BitmapDescriptorFactory.fromBitmap(bmp));
       marker.setAnchor(0.5f, 1f);
+      // First real icon for this marker — reveal it. Subsequent
+      // rasterizations leave alpha alone (pump ticks etc.).
+      if (state.pendingReveal.remove(markerId)) {
+        Float opacity = state.requestedOpacity.get(markerId);
+        marker.setAlpha(opacity != null ? opacity : 1f);
+      }
     } catch (RuntimeException e) {
       android.util.Log.w("RNAdvancedMarkers",
           "setIcon failed for " + markerId, e);
@@ -519,6 +564,8 @@ public final class RNAdvancedMarkers {
     state.liveMarkers.remove(markerId);
     state.lastSignatures.remove(markerId);
     state.tracksChanges.remove(markerId);
+    state.pendingReveal.remove(markerId);
+    state.requestedOpacity.remove(markerId);
     Bitmap bmp = state.pumpBitmaps.remove(markerId);
     if (bmp != null && !bmp.isRecycled()) bmp.recycle();
   }

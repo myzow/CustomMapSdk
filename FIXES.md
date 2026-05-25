@@ -29,6 +29,8 @@ Android: "addViewAt: failed to insert view [N] into parent [M] at index K"
 
 - **Gesture-aware pump (Issue 8)**. Calling `marker.setIcon` while GMS is in the middle of a zoom/pinch/drag animation interleaves marker texture updates with map composition — the visible result is a flicker on each new frame. Fixed by gating the pump on a `cameraMoving` / `advancedCameraMoving` flag set in `OnCameraMoveStartedListener` (Android) / `mapView:willMove:` (iOS) and cleared in `OnCameraIdleListener` / `mapView:idleAtCameraPosition:`. The React animations on the snapshot views keep running in the background; the next pump tick after camera idle resumes from the current animation state seamlessly.
 
+- **Post-gesture marker reveal (Issue 9 — the red-pin flash)**. Cluster recomputes on drag/zoom-idle destroy and recreate markers (bucket IDs change with zoom). There's then a 50–200ms gap before React mounts the new snapshot view and the first `setAdvancedMarkerView` callback lands. During that gap an `alpha=1` marker shows whatever icon the SDK provides — sometimes our transparent placeholder, sometimes (on Android, depending on internal renderer state) the default red pin. Fixed by creating every new custom-view marker at `alpha=0` and tracking it in a `pendingReveal` set. The first call to `rasterizeOnce` / `rasterizeAdvancedMarker:` removes the id from the set and restores the user's requested opacity. Result: markers are simply invisible during the load gap — no red pin, no placeholder, no flash. They fade in (well, snap in at full opacity) the instant the first real icon is ready.
+
 - **No reparenting of React views — at all.** RN-Fabric-safe by construction.
 
 ---
