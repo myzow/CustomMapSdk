@@ -510,7 +510,8 @@ using namespace facebook::react;
   [self rasterizeAdvancedMarker:markerId
                           source:markerView
                           marker:marker
-              useSignatureCache:!tracksChanges];
+              useSignatureCache:!tracksChanges
+                       fastPath:NO];
 
   if (tracksChanges) {
     [self.advancedLiveMarkers addObject:markerId];
@@ -523,25 +524,51 @@ using namespace facebook::react;
 /**
  * One-shot rasterization. Cached UIImage keyed by content signature so
  * the static path's cluster recomputes are no-ops.
+ *
+ * <p>The two callers want very different semantics:
+ * <ul>
+ *   <li><b>Static path</b> ({@code useSignatureCache=YES}). Capture once,
+ *       reuse forever. Uses {@code afterScreenUpdates:YES} so the
+ *       captured image reflects any pending layout — fine because we
+ *       only do this once.</li>
+ *   <li><b>Live pump</b> ({@code useSignatureCache=NO}). Capture each
+ *       frame. Critically we must use {@code afterScreenUpdates:YES}
+ *       here too — otherwise {@code drawViewHierarchyInRect:} reads the
+ *       <i>model</i> layer state, which lags one frame behind any
+ *       useNativeDriver animation running on the <i>presentation</i>
+ *       layer. That mismatch is exactly what produces the visible
+ *       judder / blink users see when an animated marker pulses at
+ *       30 FPS. With {@code YES} the call forces a model-layer sync to
+ *       the current presentation state before snapshotting, which
+ *       costs an extra layout pass but eliminates the flicker.</li>
+ * </ul>
+ *
+ * <p>We also skip the {@code marker.icon = image} setter when the
+ * pointer already matches — GMS treats this as a no-op internally but
+ * verifying here avoids an extra ObjC message dispatch + the
+ * {@code groundAnchor} / {@code tracksViewChanges} setters that follow.
  */
 - (void)rasterizeAdvancedMarker:(NSString *)markerId
                           source:(UIView *)reactView
                           marker:(GMSAdvancedMarker *)marker
               useSignatureCache:(BOOL)useSignatureCache
+                       fastPath:(BOOL)fastPath
 {
   CGSize size = reactView.bounds.size;
   if (size.width <= 0 || size.height <= 0) return;
 
-  NSString *signature = [NSString stringWithFormat:@"%@:%p:%.0fx%.0f",
-                         markerId, (void *)reactView, size.width, size.height];
+  NSString *signature = nil;
   if (useSignatureCache) {
+    signature = [NSString stringWithFormat:@"%@:%p:%.0fx%.0f",
+                 markerId, (void *)reactView, size.width, size.height];
     UIImage *prev = [self.viewBitmapCache objectForKey:signature];
-    if (prev && marker.icon == prev) return;
     if (prev) {
-      if (marker.iconView) marker.iconView = nil;
-      marker.icon = prev;
-      marker.groundAnchor = CGPointMake(0.5, 1);
-      marker.tracksViewChanges = NO;
+      if (marker.icon != prev) {
+        if (marker.iconView) marker.iconView = nil;
+        marker.icon = prev;
+        marker.groundAnchor = CGPointMake(0.5, 1);
+        marker.tracksViewChanges = NO;
+      }
       return;
     }
   }
@@ -549,14 +576,16 @@ using namespace facebook::react;
   UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
   fmt.opaque = NO;
   UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
+  // fastPath=YES is the pump-tick caller, which has already issued a
+  // global CATransaction flush — model layer is already in sync, so we
+  // can use the cheap afterScreenUpdates:NO. fastPath=NO is the
+  // one-shot caller (initial bind / static path) where we don't know
+  // the model-layer state and need YES to force a sync.
+  BOOL afterUpdates = !fastPath;
   UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
-    // afterScreenUpdates:NO is important during the pump tick — calling
-    // YES would re-run the layout pass and tank FPS. The animation drives
-    // the UIView's render server state which drawViewHierarchyInRect
-    // captures as-is.
-    [reactView drawViewHierarchyInRect:reactView.bounds afterScreenUpdates:NO];
+    [reactView drawViewHierarchyInRect:reactView.bounds afterScreenUpdates:afterUpdates];
   }];
-  if (useSignatureCache) {
+  if (useSignatureCache && signature) {
     [self.viewBitmapCache setObject:image forKey:signature];
   }
   if (marker.iconView) marker.iconView = nil;
@@ -576,10 +605,17 @@ using namespace facebook::react;
   if (shouldRun && !self.advancedPumpLink) {
     CADisplayLink *link = [CADisplayLink displayLinkWithTarget:self
                                                      selector:@selector(pumpAdvancedLiveMarkers:)];
+    // Run at the display's native refresh rate so the captured animation
+    // state matches what the display can actually show. 30 FPS (the
+    // previous setting) was the source of the visible judder users
+    // reported as "blinking": the React animation runs at 60 FPS, was
+    // sampled at 30, displayed at 60 — every other display frame held
+    // the previous capture, producing a stair-step rhythm regardless of
+    // how smooth the source animation was.
     if (@available(iOS 15.0, *)) {
-      link.preferredFrameRateRange = CAFrameRateRangeMake(15.0f, 30.0f, 30.0f);
+      link.preferredFrameRateRange = CAFrameRateRangeMake(30.0f, 60.0f, 60.0f);
     } else {
-      link.preferredFramesPerSecond = 30;
+      link.preferredFramesPerSecond = 60;
     }
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     self.advancedPumpLink = link;
@@ -591,7 +627,17 @@ using namespace facebook::react;
 
 - (void)pumpAdvancedLiveMarkers:(CADisplayLink *)sender
 {
-  // Snapshot the set (copy) — rasterization may remove ids on failure.
+  // One synchronous Core Animation commit at the start of the pump
+  // tick — flushes all pending animation state (useNativeDriver
+  // transforms, Lottie frame advances, ActivityIndicator rotation)
+  // into the model layer. With the model layer now in sync, each
+  // per-marker snapshot can use the much cheaper
+  // afterScreenUpdates:NO. Net effect: one commit per frame for the
+  // whole map instead of N commits (one per marker), and the captured
+  // images all reflect the same render-server state — no inter-marker
+  // tearing.
+  [CATransaction flush];
+
   NSArray<NSString *> *ids = self.advancedLiveMarkers.allObjects;
   for (NSString *markerId in ids) {
     UIView *src = self.advancedIconViews[markerId];
@@ -600,7 +646,8 @@ using namespace facebook::react;
     [self rasterizeAdvancedMarker:markerId
                             source:src
                             marker:marker
-                useSignatureCache:NO];
+                useSignatureCache:NO
+                       fastPath:YES];
   }
 }
 

@@ -17,13 +17,39 @@ iOS:     "Attempt to unmount a view which is mounted inside different view."
 Android: "addViewAt: failed to insert view [N] into parent [M] at index K"
 ```
 
-**Fix — bitmap pumping (the RN-safe live-animation path).** The React view is left exactly where React put it (the off-screen snapshot subtree) and we snapshot its visual content into a bitmap that GMS displays as the marker icon. For live animation we re-snapshot on a Choreographer / CADisplayLink tick.
+**Fix — bitmap pumping at 60 FPS, vsync-locked.** The React view is left exactly where React put it (the off-screen snapshot subtree) and we snapshot its visual content into a bitmap that GMS displays as the marker icon. The pump runs at the display's refresh rate so the sampled animation state matches what the display can show — eliminates the every-other-frame stair-step that produced the visible "blinking" at 30 FPS.
 
-- **Android (`RNAdvancedMarkers.java`)**: a single per-view `Choreographer.FrameCallback` iterates the `liveMarkers` set every ~33ms (30 FPS throttle). For each id, the React snapshot view's current visual is captured via `View.draw(Canvas)` into a per-marker reusable `Bitmap`, wrapped in a fresh `BitmapDescriptor`, and pushed to the marker via `setIcon`. The pump auto-starts when the first live marker arrives and auto-stops when the last is removed.
-- **iOS (`RNCustomMapView.mm`)**: same design with `CADisplayLink` throttled to 30 FPS (`preferredFrameRateRange = (15, 30, 30)`). Each tick calls `drawViewHierarchyInRect:afterScreenUpdates:NO` on the React UIView and assigns the resulting UIImage to `marker.icon`. `afterScreenUpdates:NO` skips an unnecessary layout pass per frame — critical for the FPS target.
+- **Android (`RNAdvancedMarkers.java`)**: a single per-view `Choreographer.FrameCallback` iterates the `liveMarkers` set every ~16ms (60 FPS, vsync-locked). For each id, the React snapshot view's current visual is captured via `View.draw(Canvas)` into a per-marker reusable `Bitmap`, wrapped in a fresh `BitmapDescriptor`, and pushed to the marker via `setIcon`. The pump auto-starts when the first live marker arrives and auto-stops when the last is removed.
+
+- **iOS (`RNCustomMapView.mm`)**: same design with `CADisplayLink` running at the device's native refresh rate (`preferredFrameRateRange = (30, 60, 60)`). The pump tick issues **one** synchronous `CATransaction flush` at the start of the frame, then snapshots every live marker with the cheap `drawViewHierarchyInRect:afterScreenUpdates:NO` — model layer is already in sync from the flush, so each per-marker capture reflects the current presentation state (including useNativeDriver transforms) without paying for a per-marker CA commit. Net: one global commit per frame for the whole map instead of N per-marker commits.
+
 - **`tracksViewChanges` (boolean, default `true`)**: opt out to the cached static-bitmap path with content-signature dedup (one rasterization, reused forever). Recommended for dense scenes (500+ markers) where individual markers don't animate.
+
 - **Unmount safety**: JS dispatches a `-1` sentinel to `setAdvancedMarkerView` when React's ref returns null. Native drops the cached snapshot reference before RN deallocates the UIView/View, so the pump never tries to draw against a zombie pointer.
-- **No reparenting of React views — at all.** RN-Fabric-safe by construction. Animations that drive view state (Animated.View with any driver, Lottie, ActivityIndicator, Reanimated layout/style props) capture correctly because `View.draw(canvas)` / `drawViewHierarchyInRect:` read the View's current render-server state.
+
+- **No reparenting of React views — at all.** RN-Fabric-safe by construction.
+
+---
+
+## Issue 7 — `<View>` wrappers around `<AdvancedMarker>` weren't detected
+
+**Root cause.** `parseChildren` only walked direct children of `<MapView>`. The common pattern
+
+```jsx
+<MapView>
+  {users.map(user => (
+    <View key={user.userId}>
+      <AdvancedMarker coordinate={user.coords}>
+        <UserPin user={user} />
+      </AdvancedMarker>
+    </View>
+  ))}
+</MapView>
+```
+
+silently produced zero markers because the parser saw the `<View>`s and stopped.
+
+**Fix.** `parseChildren` is now a depth-first recursive walker. When it encounters an element that isn't a known map type (`<AdvancedMarker>` / `<Marker>` / `<Polyline>` / `<Circle>`), it recurses into that element's `children` prop. Fragments, `<View>` wrappers, and any plain pass-through component are now transparent. Known marker elements are NOT recursed into — their children belong to the marker's custom view, not to the map's child set.
 
 
 ---

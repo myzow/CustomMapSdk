@@ -78,8 +78,21 @@ import java.util.Set;
  */
 public final class RNAdvancedMarkers {
 
-  /** Minimum nanoseconds between live re-snapshots (~30 FPS). */
-  private static final long PUMP_INTERVAL_NS = 33_000_000L;
+  /**
+   * Pump interval in nanoseconds. 16.67ms = 60 FPS — matches the
+   * device's vsync so every animation frame on the React view is
+   * captured at the rate the display can show it. 30 FPS (the previous
+   * setting) caused visible judder because the animation's 60 FPS state
+   * changes were sampled at half the display rate, producing every-other-
+   * frame stutter regardless of how smooth the underlying animation was.
+   *
+   * <p>Cost: one {@code marker.setIcon} call per visible live marker
+   * per frame. At typical animated-marker counts (5–10) this is well
+   * under one frame budget on a mid-range device. For 50+ animated
+   * markers, switch some to {@code tracksViewChanges=false} (the
+   * cached-bitmap path has zero pump cost).
+   */
+  private static final long PUMP_INTERVAL_NS = 16_000_000L;
 
   /** Cluster item kept for ClusterManager compatibility. Not used for rendering. */
   static final class RNAdvancedClusterItem implements ClusterItem {

@@ -185,150 +185,190 @@ function parseChildren(children: React.ReactNode) {
   const markerMeta = new Map<string, MarkerMeta>();
   const advancedMarkerMeta = new Map<string, AdvancedMarkerMeta>();
 
-  React.Children.forEach(children, (child, index) => {
-    if (!React.isValidElement(child)) return;
+  /**
+   * Walks the JSX tree depth-first looking for known map elements.
+   *
+   * <p>This is recursive so wrappers like {@code <View key={user.id}>} or
+   * {@code <Fragment>} or any plain pass-through component the consumer
+   * uses for organization are transparent — the parser keeps drilling
+   * until it finds an {@code <AdvancedMarker>} / {@code <Marker>} /
+   * {@code <Polyline>} / {@code <Circle>}. This is what enables the
+   * "current syntax should also work" requirement:
+   *
+   * <pre>{@code
+   *   <View key={user.userId}>
+   *     <AdvancedMarker coordinate={coords} tracksViewChanges>
+   *       <CustomActivityIndicator />
+   *     </AdvancedMarker>
+   *   </View>
+   * }</pre>
+   *
+   * <p>When a known marker element is found we do <b>not</b> recurse
+   * into its children — those children ARE the custom marker view and
+   * belong to the marker, not to the map's child set.
+   */
+  let walkIndex = 0;
+  const visit = (node: React.ReactNode) => {
+    React.Children.forEach(node, child => {
+      if (!React.isValidElement(child)) return;
+      const index = walkIndex++;
 
-    if (isAdvancedMarkerNode(child)) {
-      const props = child.props;
-      const id = props.identifier ?? `advanced-marker-${index}`;
-      const customChildren = getMarkerCustomChildren(child);
-      advancedMarkers.push(
-        compactObject({
-          id,
-          latitude: props.coordinate.latitude,
-          longitude: props.coordinate.longitude,
-          title: props.title,
-          description: props.description,
-          pinColor: props.pinColor,
-          draggable: props.draggable,
-          flat: props.flat,
-          rotation: props.rotation,
-          opacity: props.opacity,
-          anchor: props.anchor,
-          zIndex: props.zIndex,
-          hasCustomView: customChildren !== null,
-          tracksViewChanges: props.tracksViewChanges,
-        }) as NativeAdvancedMarker,
-      );
-      advancedMarkerMeta.set(id, {
-        id,
-        coordinate: props.coordinate,
-        data: props.data,
-        title: props.title,
-        isCustom: customChildren !== null,
-      });
-      if (customChildren) {
-        advancedMarkerSnapshots.push({ id, children: customChildren });
-      }
-      if (props.onPress) markerPressHandlers.set(id, props.onPress);
-      if (props.onSelect) markerSelectHandlers.set(id, props.onSelect);
-      if (props.onDeselect) markerDeselectHandlers.set(id, props.onDeselect);
-      if (props.onDragStart) markerDragStartHandlers.set(id, props.onDragStart);
-      if (props.onDrag) markerDragHandlers.set(id, props.onDrag);
-      if (props.onDragEnd) markerDragEndHandlers.set(id, props.onDragEnd);
-      return;
-    }
-
-    if (isMarkerNode(child)) {
-      const props = child.props;
-      const id = props.identifier ?? props.id ?? `marker-${index}`;
-      const callout = getMarkerCallout(child);
-      const customChildren = getMarkerCustomChildren(child);
-      const markerRef = (child as any).ref ?? (child.props as any).ref;
-      const fallback = props.fallback;
-
-      markers.push(
-        compactObject({
-          id,
-          latitude: props.coordinate.latitude,
-          longitude: props.coordinate.longitude,
-          title: props.title,
-          description: props.description,
-          pinColor: props.pinColor,
-          image: resolveImageSource(props.image),
-          icon: resolveImageSource(props.icon),
-          fallbackColor: fallback?.color,
-          fallbackInitial: fallback?.initial,
-          fallbackRingColor: fallback?.ringColor,
-          centerOffset: props.centerOffset,
-          calloutOffset: props.calloutOffset,
-          anchor: props.anchor,
-          calloutAnchor: props.calloutAnchor,
-          draggable: props.draggable,
-          flat: props.flat,
-          rotation: props.rotation,
-          opacity: props.opacity,
-          tappable: props.tappable,
-          tracksViewChanges: props.tracksViewChanges,
-          calloutTooltip: callout.tooltip,
-        }),
-      );
-
-      const data = props.data !== undefined ? props.data : props.userData;
-      const resolvedImageUri =
-        resolveImageSource(props.image) ?? resolveImageSource(props.icon);
-      markerMeta.set(id, {
-        id,
-        coordinate: props.coordinate,
-        data,
-        title: props.title,
-        imageUri: resolvedImageUri,
-        fallback,
-        isCustom: customChildren !== null,
-      });
-
-      if (markerRef) markerRefs.set(id, markerRef);
-      if (customChildren)
-        markerSnapshots.push({ id, children: customChildren });
-      if (props.onPress) markerPressHandlers.set(id, props.onPress);
-      if (props.onSelect) markerSelectHandlers.set(id, props.onSelect);
-      if (props.onDeselect) markerDeselectHandlers.set(id, props.onDeselect);
-      if (props.onDragStart) markerDragStartHandlers.set(id, props.onDragStart);
-      if (props.onDrag) markerDragHandlers.set(id, props.onDrag);
-      if (props.onDragEnd) markerDragEndHandlers.set(id, props.onDragEnd);
-      if (props.onCalloutPress || callout.onPress) {
-        calloutPressHandlers.set(
-          id,
-          (props.onCalloutPress ?? callout.onPress)!,
+      if (isAdvancedMarkerNode(child)) {
+        const props = child.props;
+        const id = props.identifier ?? `advanced-marker-${index}`;
+        const customChildren = getMarkerCustomChildren(child);
+        advancedMarkers.push(
+          compactObject({
+            id,
+            latitude: props.coordinate.latitude,
+            longitude: props.coordinate.longitude,
+            title: props.title,
+            description: props.description,
+            pinColor: props.pinColor,
+            draggable: props.draggable,
+            flat: props.flat,
+            rotation: props.rotation,
+            opacity: props.opacity,
+            anchor: props.anchor,
+            zIndex: props.zIndex,
+            hasCustomView: customChildren !== null,
+            tracksViewChanges: props.tracksViewChanges,
+          }) as NativeAdvancedMarker,
         );
-      }
-      return;
-    }
-
-    if (child.type === Polyline || childTypeName(child) === 'RNCustomMapPolyline') {
-      const props = child.props as PolylineProps;
-      const id = props.id ?? `polyline-${index}`;
-      polylines.push(
-        compactObject({
+        advancedMarkerMeta.set(id, {
           id,
-          coordinates: props.coordinates,
-          strokeColor: props.strokeColor,
-          strokeWidth: props.strokeWidth,
-          lineDashPattern: props.lineDashPattern,
-          geodesic: props.geodesic,
-          zIndex: props.zIndex,
-          tappable: props.tappable,
-        }),
-      );
-      if (props.onPress) polylinePressHandlers.set(id, props.onPress);
-      return;
-    }
+          coordinate: props.coordinate,
+          data: props.data,
+          title: props.title,
+          isCustom: customChildren !== null,
+        });
+        if (customChildren) {
+          advancedMarkerSnapshots.push({ id, children: customChildren });
+        }
+        if (props.onPress) markerPressHandlers.set(id, props.onPress);
+        if (props.onSelect) markerSelectHandlers.set(id, props.onSelect);
+        if (props.onDeselect) markerDeselectHandlers.set(id, props.onDeselect);
+        if (props.onDragStart) markerDragStartHandlers.set(id, props.onDragStart);
+        if (props.onDrag) markerDragHandlers.set(id, props.onDrag);
+        if (props.onDragEnd) markerDragEndHandlers.set(id, props.onDragEnd);
+        return;
+      }
 
-    if (child.type === Circle || childTypeName(child) === 'RNCustomMapCircle') {
-      const props = child.props as CircleProps;
-      circles.push(
-        compactObject({
-          id: props.id ?? `circle-${index}`,
-          center: props.center,
-          radius: props.radius,
-          strokeColor: props.strokeColor,
-          strokeWidth: props.strokeWidth,
-          fillColor: props.fillColor,
-          zIndex: props.zIndex,
-        }),
-      );
-    }
-  });
+      if (isMarkerNode(child)) {
+        const props = child.props;
+        const id = props.identifier ?? props.id ?? `marker-${index}`;
+        const callout = getMarkerCallout(child);
+        const customChildren = getMarkerCustomChildren(child);
+        const markerRef = (child as any).ref ?? (child.props as any).ref;
+        const fallback = props.fallback;
+
+        markers.push(
+          compactObject({
+            id,
+            latitude: props.coordinate.latitude,
+            longitude: props.coordinate.longitude,
+            title: props.title,
+            description: props.description,
+            pinColor: props.pinColor,
+            image: resolveImageSource(props.image),
+            icon: resolveImageSource(props.icon),
+            fallbackColor: fallback?.color,
+            fallbackInitial: fallback?.initial,
+            fallbackRingColor: fallback?.ringColor,
+            centerOffset: props.centerOffset,
+            calloutOffset: props.calloutOffset,
+            anchor: props.anchor,
+            calloutAnchor: props.calloutAnchor,
+            draggable: props.draggable,
+            flat: props.flat,
+            rotation: props.rotation,
+            opacity: props.opacity,
+            tappable: props.tappable,
+            tracksViewChanges: props.tracksViewChanges,
+            calloutTooltip: callout.tooltip,
+          }),
+        );
+
+        const data = props.data !== undefined ? props.data : props.userData;
+        const resolvedImageUri =
+          resolveImageSource(props.image) ?? resolveImageSource(props.icon);
+        markerMeta.set(id, {
+          id,
+          coordinate: props.coordinate,
+          data,
+          title: props.title,
+          imageUri: resolvedImageUri,
+          fallback,
+          isCustom: customChildren !== null,
+        });
+
+        if (markerRef) markerRefs.set(id, markerRef);
+        if (customChildren)
+          markerSnapshots.push({ id, children: customChildren });
+        if (props.onPress) markerPressHandlers.set(id, props.onPress);
+        if (props.onSelect) markerSelectHandlers.set(id, props.onSelect);
+        if (props.onDeselect) markerDeselectHandlers.set(id, props.onDeselect);
+        if (props.onDragStart) markerDragStartHandlers.set(id, props.onDragStart);
+        if (props.onDrag) markerDragHandlers.set(id, props.onDrag);
+        if (props.onDragEnd) markerDragEndHandlers.set(id, props.onDragEnd);
+        if (props.onCalloutPress || callout.onPress) {
+          calloutPressHandlers.set(
+            id,
+            (props.onCalloutPress ?? callout.onPress)!,
+          );
+        }
+        return;
+      }
+
+      if (child.type === Polyline || childTypeName(child) === 'RNCustomMapPolyline') {
+        const props = child.props as PolylineProps;
+        const id = props.id ?? `polyline-${index}`;
+        polylines.push(
+          compactObject({
+            id,
+            coordinates: props.coordinates,
+            strokeColor: props.strokeColor,
+            strokeWidth: props.strokeWidth,
+            lineDashPattern: props.lineDashPattern,
+            geodesic: props.geodesic,
+            zIndex: props.zIndex,
+            tappable: props.tappable,
+          }),
+        );
+        if (props.onPress) polylinePressHandlers.set(id, props.onPress);
+        return;
+      }
+
+      if (child.type === Circle || childTypeName(child) === 'RNCustomMapCircle') {
+        const props = child.props as CircleProps;
+        circles.push(
+          compactObject({
+            id: props.id ?? `circle-${index}`,
+            center: props.center,
+            radius: props.radius,
+            strokeColor: props.strokeColor,
+            strokeWidth: props.strokeWidth,
+            fillColor: props.fillColor,
+            zIndex: props.zIndex,
+          }),
+        );
+        return;
+      }
+
+      // Unknown element — could be a wrapper like <View>, a Fragment, or
+      // a consumer-defined HOC. Recurse into its children so the user can
+      // group marker children for keying / readability without breaking
+      // the parser. We do NOT recurse into known marker elements (their
+      // children are the marker's custom view, not map children).
+      const childChildren = (child.props as { children?: React.ReactNode })
+        ?.children;
+      if (childChildren != null) {
+        visit(childChildren);
+      }
+    });
+  };
+
+  visit(children);
 
   return {
     markers,
